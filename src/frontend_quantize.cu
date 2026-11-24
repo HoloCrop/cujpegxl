@@ -299,7 +299,8 @@ __global__ void __launch_bounds__(QUANT_THREADS, QUANT_BLOCKS_PER_SM)
                          std::int8_t* __restrict__ ytox_map, std::int8_t* __restrict__ ytob_map,
                          std::int16_t* __restrict__ ac, std::int32_t* __restrict__ dc,
                          std::int32_t* __restrict__ nz_exact, std::int32_t* __restrict__ nz_grid,
-                         CoeffOrderStats* __restrict__ order_stats) {
+                         CoeffOrderStats* __restrict__ order_stats, int sample_phase) {
+    const bool collect = sample_phase < 0 || (blockIdx.x % 16 == unsigned(sample_phase));
     __shared__ __align__(16) __half tile_coeffs[3][TILE_SLOTS];
     __shared__ std::uint64_t tile_llf_mask[TILE_POSITIONS];
     // The owner's quantizer strength and its reciprocal.
@@ -331,7 +332,7 @@ __global__ void __launch_bounds__(QUANT_THREADS, QUANT_BLOCKS_PER_SM)
     for (std::uint32_t i{0}; i < FETCH_VECTORS; ++i) {
         reinterpret_cast<uint4*>(&tile_coeffs[0][0])[i * QUANT_THREADS + tid] = fetched.coeffs[i];
     }
-    if (tid < PACKED_ORDER_STATS_VECTORS) {
+    if (collect && tid < PACKED_ORDER_STATS_VECTORS) {
         reinterpret_cast<uint4*>(tile_order_stats)[tid] = make_uint4(0, 0, 0, 0);
     }
     TilePosition pos{};
@@ -465,8 +466,9 @@ __global__ void __launch_bounds__(QUANT_THREADS, QUANT_BLOCKS_PER_SM)
         if (lane == 0 && nz != 0) {
             atomicAdd(&tile_nz[1][at_pos.owner], nz);
         }
-        count_lane_nonzeros(tile_order_stats, position_stats_base(at_pos, 1), lane, nonzero[0],
-                            nonzero[1]);
+        if (collect)
+            count_lane_nonzeros(tile_order_stats, position_stats_base(at_pos, 1), lane, nonzero[0],
+                                nonzero[1]);
     }
     __syncthreads();
 
@@ -540,10 +542,12 @@ __global__ void __launch_bounds__(QUANT_THREADS, QUANT_BLOCKS_PER_SM)
         if (lane == 1 && nz_b != 0) {
             atomicAdd(&tile_nz[2][at_pos.owner], nz_b);
         }
-        count_lane_nonzeros(tile_order_stats, position_stats_base(at_pos, 0), lane, nonzero_x[0],
-                            nonzero_x[1]);
-        count_lane_nonzeros(tile_order_stats, position_stats_base(at_pos, 2), lane, nonzero_b[0],
-                            nonzero_b[1]);
+        if (collect)
+            count_lane_nonzeros(tile_order_stats, position_stats_base(at_pos, 0), lane,
+                                nonzero_x[0], nonzero_x[1]);
+        if (collect)
+            count_lane_nonzeros(tile_order_stats, position_stats_base(at_pos, 2), lane,
+                                nonzero_b[0], nonzero_b[1]);
     }
     __syncthreads();
 
@@ -560,6 +564,8 @@ __global__ void __launch_bounds__(QUANT_THREADS, QUANT_BLOCKS_PER_SM)
             nz_grid[c * nblk + blk] = static_cast<std::int32_t>((nz + covered - 1) >> log2_covered);
         }
     }
+    if (!collect)
+        return;
     if (first_block) {
         count_order_stat(
             tile_order_stats,
@@ -583,12 +589,12 @@ __global__ void __launch_bounds__(QUANT_THREADS, QUANT_BLOCKS_PER_SM)
 
 }  // namespace
 
-bool quantize_residual(const __half* coeffs, const std::int8_t* acs,
-                       const std::int32_t* quant_field, const QuantCalibration* calibration,
-                       std::size_t width, std::size_t height, std::int8_t* ytox_map,
-                       std::int8_t* ytob_map, std::int16_t* ac, std::int32_t* dc,
-                       std::int32_t* nz_exact, std::int32_t* nz_grid, CoeffOrderStats* order_stats,
-                       cudaStream_t stream) {
+bool quantize_scan_residual(const __half* coeffs, const std::int8_t* acs,
+                            const std::int32_t* quant_field, const QuantCalibration* calibration,
+                            std::size_t width, std::size_t height, std::int8_t* ytox_map,
+                            std::int8_t* ytob_map, std::int16_t* ac, std::int32_t* dc,
+                            std::int32_t* nz_exact, std::int32_t* nz_grid,
+                            CoeffOrderStats* order_stats, cudaStream_t stream, int sample_phase) {
     const std::size_t bw{width / 8};
     const std::size_t bh{height / 8};
     const LlfDcTerms* dc_terms{llf_dc_terms_device()};
@@ -597,14 +603,25 @@ bool quantize_residual(const __half* coeffs, const std::int8_t* acs,
     }
     const std::uint32_t tiles_x{static_cast<std::uint32_t>(ceil_div(bw, TILE_SIDE))};
     const std::uint32_t tiles{tiles_x * static_cast<std::uint32_t>(ceil_div(bh, TILE_SIDE))};
-    if (cudaMemsetAsync(order_stats, 0, sizeof(CoeffOrderStats), stream) != cudaSuccess) {
+    if (sample_phase < 0 &&
+        cudaMemsetAsync(order_stats, 0, sizeof(CoeffOrderStats), stream) != cudaSuccess) {
         return false;
     }
     quantize_tile_kernel<<<tiles, QUANT_THREADS, 0, stream>>>(
         coeffs, acs, quant_field, dc_terms, static_cast<std::uint32_t>(bw),
         static_cast<std::uint32_t>(bh), tiles_x, calibration, ytox_map, ytob_map, ac, dc, nz_exact,
-        nz_grid, order_stats);
+        nz_grid, order_stats, sample_phase);
     return cudaGetLastError() == cudaSuccess;
+}
+
+bool quantize_residual(const __half* coeffs, const std::int8_t* acs,
+                       const std::int32_t* quant_field, const QuantCalibration* calibration,
+                       std::size_t width, std::size_t height, std::int8_t* ytox_map,
+                       std::int8_t* ytob_map, std::int16_t* ac, std::int32_t* dc,
+                       std::int32_t* nz_exact, std::int32_t* nz_grid, CoeffOrderStats* order_stats,
+                       cudaStream_t stream) {
+    return quantize_scan_residual(coeffs, acs, quant_field, calibration, width, height, ytox_map,
+                                  ytob_map, ac, dc, nz_exact, nz_grid, order_stats, stream, -1);
 }
 
 }  // namespace cujpegxl

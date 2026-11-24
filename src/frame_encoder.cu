@@ -211,8 +211,6 @@ struct FrameBuffers {
     std::int32_t* dc{nullptr};
     std::int32_t* nz_exact{nullptr};
     std::int32_t* nz_grid{nullptr};
-    CoeffOrderStats* order_stats{nullptr};
-    CoeffOrders* coeff_orders{nullptr};
     std::uint32_t* context_hist{nullptr};
     std::uint8_t* cluster_scratch{nullptr};
     std::uint64_t* item_sizes{nullptr};
@@ -264,8 +262,6 @@ FrameBuffers carve_frame_buffers(ArenaCarver& carver, std::size_t width, std::si
         .dc = carver.take<std::int32_t>(3 * blocks),
         .nz_exact = carver.take<std::int32_t>(3 * blocks),
         .nz_grid = carver.take<std::int32_t>(3 * blocks),
-        .order_stats = carver.take<CoeffOrderStats>(1),
-        .coeff_orders = carver.take<CoeffOrders>(1),
         .context_hist = carver.take<std::uint32_t>(AC_NUM_CONTEXTS * AC_CONTEXT_ALPHABET),
         .cluster_scratch = carver.take<std::uint8_t>(ac_cluster_scratch_bytes()),
         .item_sizes = carver.take<std::uint64_t>(3 * blocks),
@@ -460,9 +456,11 @@ struct FrameEncoder::State {
     const std::size_t depth;
     const std::unique_ptr<Slot[]> slots;
     DeviceArena entropy_model;
+    DeviceArena order_model;
     uint64_t generation{0};
 
-    bitstream::BitWriter description;
+    std::vector<std::uint8_t> ac_global;
+    std::size_t described_groups{0};
     uint64_t described_generation{UINT64_MAX};
     std::vector<std::uint32_t> section_sizes;
 
@@ -525,13 +523,18 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
     slot.textures.emplace(luma_src->data, luma_src->pitch, chroma_src->data, chroma_src->pitch,
                           slot.width, slot.height, slot.stream);
 
+    if (!order_model.reserve(sizeof(CoeffOrderStats) + sizeof(CoeffOrders)))
+        return false;
+    auto* order_history = reinterpret_cast<CoeffOrderStats*>(order_model.data());
+    auto* orders = reinterpret_cast<CoeffOrders*>(order_history + 1);
     const Clock::time_point frontend_start{Clock::now()};
     if (!encode_frontend(*slot.textures, slot.width, slot.height, distance, d.coeffs, d.acs,
                          d.adaptive_field, d.field_histogram, d.quant_field, d.calibration,
                          slot.stream) ||
-        !quantize_residual(d.coeffs, d.acs, d.quant_field, d.calibration, width, height, d.ytox_map,
-                           d.ytob_map, d.ac, d.dc, d.nz_exact, d.nz_grid, d.order_stats,
-                           slot.stream)) {
+        !quantize_scan_residual(d.coeffs, d.acs, d.quant_field, d.calibration, width, height,
+                                d.ytox_map, d.ytob_map, d.ac, d.dc, d.nz_exact, d.nz_grid,
+                                order_history, slot.stream,
+                                submitted == 0 ? -1 : int(submitted % 16))) {
         return false;
     }
     if (slot.stats != nullptr) {
@@ -572,12 +575,16 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
     auto model = reinterpret_cast<AcClustering*>(entropy_model.data());
     auto table = reinterpret_cast<unsigned*>(model + 1);
     auto history = table + AC_MAX_CLUSTERS * bitstream::HISTOGRAM_STRIDE;
-    if (!ac_coeff_orders(d.order_stats, d.coeff_orders, slot.stream))
+    const bool refresh =
+        submitted == 2 || submitted == 4 || submitted == 8 || (submitted && submitted % 16 == 0);
+    if ((submitted == 0 || refresh) && !ac_coeff_orders(order_history, orders, slot.stream))
         return false;
     if (submitted == 0) {
+        if (cudaMemsetAsync(order_history, 0, sizeof(*order_history), slot.stream) != cudaSuccess)
+            return false;
         if (cudaMemsetAsync(history, 0, bins * sizeof(unsigned), slot.stream) != cudaSuccess)
             return false;
-        if (!ac_build_histogram(d.ac, d.acs, d.nz_grid, d.nz_exact, d.coeff_orders, width, height,
+        if (!ac_build_histogram(d.ac, d.acs, d.nz_grid, d.nz_exact, orders, width, height,
                                 d.context_hist, d.item_sizes, d.token_records, d.ac_counters, arch,
                                 slot.stream) ||
             !ac_cluster_contexts(d.context_hist, d.cluster_scratch, model, slot.stream))
@@ -587,16 +594,19 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
         generation = submitted;
     }
     // Adapt quickly at startup, then halve the history at each 16-image refresh.
-    if (submitted == 2 || submitted == 4 || submitted == 8 || (submitted && submitted % 16 == 0)) {
+    if (refresh) {
         if (!ac_cluster_contexts(history, d.cluster_scratch, model, slot.stream))
             return false;
         if (!build_scan_prefix(model, table, slot.stream))
             return false;
         generation = submitted;
+        constexpr size_t order_words = sizeof(CoeffOrderStats) / sizeof(unsigned);
+        age_histograms<<<(order_words + 255) / 256, 256, 0, slot.stream>>>(
+            reinterpret_cast<unsigned*>(order_history), order_words);
         age_histograms<<<(bins + 255) / 256, 256, 0, slot.stream>>>(history, bins);
     }
     slot.model_generation = generation;
-    if (!ac_code_items(d.ac, d.acs, d.nz_grid, d.nz_exact, d.coeff_orders, width, height, history,
+    if (!ac_code_items(d.ac, d.acs, d.nz_grid, d.nz_exact, orders, width, height, history,
                        d.item_sizes, d.token_records, d.ac_counters, arch, slot.stream, model,
                        table, submitted % 16) ||
         !ac_token_layout(d.item_sizes, width, height, d.layout_scratch, d.ac_counters, d.chunk_base,
@@ -606,7 +616,7 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
         cudaMemcpyAsync(slot.clustering.data(), model, sizeof(AcClustering), cudaMemcpyDeviceToHost,
                         slot.stream) != cudaSuccess ||
         // The host reads only the Lehmer codes of the orders.
-        cudaMemcpyAsync(slot.coeff_orders.data()->lehmer, d.coeff_orders->lehmer,
+        cudaMemcpyAsync(slot.coeff_orders.data()->lehmer, orders->lehmer,
                         sizeof(CoeffOrders::lehmer), cudaMemcpyDeviceToHost,
                         slot.stream) != cudaSuccess ||
         cudaEventRecord(slot.layout_copied, slot.stream) != cudaSuccess) {
@@ -666,12 +676,12 @@ EncodeResult FrameEncoder::State::code_frame(Slot& slot) {
     const std::vector<std::uint8_t> dc_global{bitstream::build_dc_global(
         bitstream::QuantParams{calibration.global_scale, calibration.quant_dc})};
 
-    if (described_generation != slot.model_generation) {
-        description = bitstream::describe_scan_histograms(*slot.clustering.data());
+    if (described_generation != slot.model_generation || described_groups != num_ac) {
+        const auto description = bitstream::describe_scan_histograms(*slot.clustering.data());
+        ac_global = bitstream::build_scan_ac_global(*slot.coeff_orders.data(), num_ac, description);
+        described_groups = num_ac;
         described_generation = slot.model_generation;
     }
-    auto ac_global =
-        bitstream::build_scan_ac_global(*slot.coeff_orders.data(), num_ac, description);
     auto s = slot.stream;
     auto body = slot.device.token_records;
     auto& lengths = slot.ac_lengths;

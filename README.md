@@ -8,7 +8,7 @@ This project is a CUDA port of a JPEG XL encoder, implementing a GPU- and real-t
 
 ## HoloCrop scan encoding
 
-Keep one encoder instance alive across a scan. It builds an initial AC prefix codebook from the first image and samples one in sixteen groups of image blocks on every image. The sampling position rotates. The encoder refreshes the codebook after 2, 4 and 8 images, then every 16 images, giving recent samples more weight. Each JPEG XL file embeds the codebook it uses and decodes independently. Starting a new encoder resets the history.
+Keep one encoder instance alive across a scan. It builds an initial AC prefix codebook from the first image and samples one in sixteen groups of image blocks on every image. The sampling position rotates. The encoder refreshes the codebook after 2, 4 and 8 images, then every 16 images, giving recent samples more weight. The same schedule updates coefficient order from sampled tiles across the scan. Each JPEG XL file embeds the codebook it uses and decodes independently. Starting a new encoder resets the history.
 
 ## Goals
 

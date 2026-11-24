@@ -57,6 +57,14 @@ bool quantize_residual(const __half* coeffs, const std::int8_t* acs,
                        std::int32_t* nz_exact, std::int32_t* nz_grid, CoeffOrderStats* order_stats,
                        cudaStream_t stream);
 
+// A nonnegative phase accumulates one in sixteen tiles into the scan history.
+bool quantize_scan_residual(const __half* coeffs, const std::int8_t* acs,
+                            const std::int32_t* quant_field, const QuantCalibration* calibration,
+                            std::size_t width, std::size_t height, std::int8_t* ytox_map,
+                            std::int8_t* ytob_map, std::int16_t* ac, std::int32_t* dc,
+                            std::int32_t* nz_exact, std::int32_t* nz_grid,
+                            CoeffOrderStats* order_stats, cudaStream_t stream, int sample_phase);
+
 }  // namespace cujpegxl
 
 #endif  // CUJPEGXL_SRC_FRONTEND_QUANTIZE_H_
