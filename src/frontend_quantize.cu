@@ -299,6 +299,27 @@ __device__ inline std::uint32_t position_stats_base(const TilePosition& p, std::
 //   in the tile's packed counters, then added to `order_stats`.
 // A warp quantizes the 64 slots of one position per step (two per lane), so
 // the non-zero counts of a step all go to one first-block.
+// One strength per 16x8 luma pair ensures the same spatial support for 4:2:2 chroma.
+__device__ const unsigned char spatial_field[25]={8,5,4,4,4,4,5,4,4,4,4,6,7,3,4,6,7,5,4,5,5,4,5,6,5};
+__global__ void select_spatial_field(const __half* coeffs, unsigned bw,unsigned bh, int* field){
+    const unsigned tid=blockIdx.x*blockDim.x+threadIdx.x, lane=threadIdx.x%32;
+    const unsigned pair=tid/32, stride=(bw+1)/2;
+    if(pair>=stride*bh)return;
+    const unsigned block=pair/stride*bw+2*(pair%stride),right=min(block+1,(pair/stride+1)*bw-1);
+    const unsigned plane=bw*bh*64;
+    const float2 a=__half22float2(*reinterpret_cast<const __half2*>(coeffs+plane+block*64+2*lane));
+    const float2 b=__half22float2(*reinterpret_cast<const __half2*>(coeffs+plane+right*64+2*lane));
+    float e=(lane?a.x*a.x+b.x*b.x:0.f)+a.y*a.y+b.y*b.y;
+    for(unsigned k=16;k;k>>=1)e+=__shfl_xor_sync(~0u,e,k);
+    if(lane==0){
+        const float mean=128.f+127.5f*(a.x+b.x);
+        const float dy=127.5f*(a.x-b.x);
+        const float var=e*(2040.f*2040.f/128.f)+dy*dy;
+        const unsigned m=(mean>=8)+(mean>=16)+(mean>=32)+(mean>=96);
+        const unsigned t=(var>=16)+(var>=64)+(var>=256)+(var>=1024);
+        field[block]=field[right]=spatial_field[5*m+t];
+    }
+}
 __global__ void quantize_square(
     const __half* __restrict__ coeffs, const int* __restrict__ quant_field,
     const QuantCalibration* calibration, unsigned bw, unsigned bh, unsigned tiles_x,
@@ -380,6 +401,10 @@ __global__ void quantize_square(
 }
 
 }  // namespace
+
+void select_pair_precision(const __half* coeffs, unsigned bw,unsigned bh,int* field,cudaStream_t stream){
+    select_spatial_field<<<(((bw+1)/2)*bh+3)/4,128,0,stream>>>(coeffs,bw,bh,field);
+}
 
 bool quantize_scan_residual(const __half* coeffs, const std::int8_t* acs,
                             const std::int32_t* quant_field, const QuantCalibration* calibration,

@@ -445,10 +445,12 @@ __global__ void dc_group_blobs_kernel(std::size_t bw, std::size_t bh, std::size_
         detail::write_simple_context_map(w,mapping,4,2);
         w.write(1,1);
         detail::encode_uint_config(w,HybridUintConfig{},detail::PREFIX_MAX_BITS);
-        detail::encode_uint_config(w,HybridUintConfig{9,0,0},detail::PREFIX_MAX_BITS);
-        const unsigned qsymbol=2*(qf[0]-1);
-        detail::store_var_len_uint16(w,0);detail::store_var_len_uint16(w,qsymbol);
-        if(qsymbol){w.write(4,1);w.write(detail::ceil_log2_nonzero(qsymbol+1),qsymbol);}
+        detail::encode_uint_config(w,HybridUintConfig{},detail::PREFIX_MAX_BITS);
+        const auto data=summarize_histogram(s.data.code.hist,HISTOGRAM_STRIDE,lane);
+        detail::store_var_len_uint16(w,0);detail::store_var_len_uint16(w,data.alphabet-1);
+        warp_write_prefix_code(s.data.code,data.alphabet,w,s.data.code_length,s.data.tree,lane);
+        __syncwarp();
+        store_code(s.data.code,am_depth+g*HISTOGRAM_STRIDE,am_bits+g*HISTOGRAM_STRIDE,lane);
     } else {
         bitstream::write_bits(w,2,0);
         detail::TreeTokens tree{{1,0,11,6,11,6},6};

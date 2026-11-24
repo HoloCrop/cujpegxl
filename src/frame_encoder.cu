@@ -544,6 +544,7 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
             cudaSuccess) {
         return false;
     }
+    select_pair_precision(d.coeffs,width/8,height/8,d.quant_field,slot.stream);
     if (!quantize_scan_residual(d.coeffs, d.acs, d.quant_field, d.calibration, width,
                                 height, d.ytox_map, d.ytob_map, d.ac, d.dc, d.nz_exact,
                                 d.nz_grid, order_history, slot.stream,

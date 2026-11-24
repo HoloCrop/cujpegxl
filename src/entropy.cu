@@ -298,7 +298,7 @@ __device__ DcCtx build_dc_ctx(std::uint32_t g, const std::int32_t* dc, std::uint
     c.cw = (c.gbw + 7) / 8;
     c.ch = (c.gbh + 7) / 8;
     c.count = static_cast<std::uint32_t>(fb_count[g]);
-    c.m=2*c.n+2;
+    c.m=3*c.n+2;
     return c;
 }
 
@@ -342,6 +342,11 @@ __device__ void dc_put_items(const DcCtx& c, std::uint32_t a0, std::uint32_t a1,
     if (k == 1 + 2 * c.n && k < a1) {
         sink.put_blob(c.mid, c.mid_bits);
         ++k;
+    }
+    for (;k<a1;++k){
+        const unsigned local=k-(2*c.n+2);
+        const unsigned block=(c.by0+local/c.gbw)*c.bw+c.bx0+local%c.gbw;
+        dc_put_signed(sink,c.amd,c.amb,c.qf[block]-1);
     }
 
 }
@@ -563,7 +568,6 @@ __global__ void dc_group_stats_kernel(const std::int32_t* dc_buf, const std::int
                 const int side{acs == nullptr ? 8 : acs[block]};
                 first_block = side != ACS_COVERED;
                 if (first_block) {
-                    count_signed_token(raw_strategy_dev(side), am_sh);
                     count_signed_token(quant_field[block] - 1, am_sh);
                 }
             }
@@ -574,12 +578,6 @@ __global__ void dc_group_stats_kernel(const std::int32_t* dc_buf, const std::int
         }
     }
     const std::size_t ctx{blockIdx.y * COLOR_TILES_PER_DC_GROUP + threadIdx.x};
-    if (blockIdx.x % STRIPS_PER_COLOR_TILE == 0 && threadIdx.x < COLOR_TILES_PER_DC_GROUP &&
-        ctx < cmw) {
-        const std::size_t tile{(blockIdx.x / STRIPS_PER_COLOR_TILE) * cmw + ctx};
-        count_signed_token(ytox_map == nullptr ? 0 : ytox_map[tile], am_sh);
-        count_signed_token(ytob_map == nullptr ? 0 : ytob_map[tile], am_sh);
-    }
     __syncthreads();
     flush_group_histogram(dc_sh, histograms + g * AC_HISTOGRAM_SIZE);
     flush_group_histogram(am_sh, histograms + (num_groups + g) * AC_HISTOGRAM_SIZE);
