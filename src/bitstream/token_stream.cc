@@ -17,8 +17,8 @@ namespace {
 constexpr std::size_t NO_STREAM{SIZE_MAX};
 
 // Streams coded in lockstep by one caller: enough independent state chains to
-// hide the latency of one rANS step (measured best at 2-3 on Zen+).
-constexpr std::size_t LANES{2};
+// hide the latency of the dependent state update.
+constexpr std::size_t LANES{3};
 
 // 64-bit reciprocal precision of libjxl's PutSymbol (state bits + table bits).
 constexpr std::uint32_t RECIPROCAL_PRECISION{32 + ANS_LOG_TAB_SIZE};
@@ -33,26 +33,26 @@ struct BackWriter {
     std::uint32_t fill{0};
 
     void prepend(std::uint64_t bits, std::uint32_t n) {
-        assert(n <= 32 && (bits >> n) == 0);
-        if (fill + n > 64) {
-            const std::uint32_t kept{fill + n - 64};
-            --out;
-            *out = (acc << (64 - fill)) | (bits >> kept);
-            acc = bits & ((std::uint64_t{1} << kept) - 1);
-            fill = kept;
-        } else {
-            acc = (acc << n) | bits;
-            fill += n;
-        }
+        assert(n < 64 && (bits >> n) == 0);
+        // The spare word in the capacity bound makes this store safe even
+        // when it is speculative. Only advance the cursor on overflow.
+        const std::uint32_t total{fill + n};
+        const std::uint32_t excess{total & 63};  // overflow bits when total > 64
+        out[-1] = (acc << ((64 - fill) & 63)) | (bits >> excess);
+        const bool flush{total > 64};
+        out -= flush;
+        fill = total - 64 * flush;
+        // Only the low fill bits are live. The next flush shifts out stale
+        // high bits; store() masks them when publishing the final head.
+        acc = (acc << n) | bits;
     }
 };
 
 std::uint32_t read_raw(const std::uint64_t* raw, std::uint64_t pos, std::uint32_t n) {
-    const std::uint64_t word{pos >> 6};
-    const auto shift{static_cast<std::uint32_t>(pos & 63)};
-    std::uint64_t v{raw[word] >> shift};
-    v |= shift != 0 ? raw[word + 1] << (64 - shift) : 0;
-    return static_cast<std::uint32_t>(v & ((std::uint64_t{1} << n) - 1));
+    // TokenStream guarantees a readable trailing word for this unaligned load.
+    std::uint64_t window;
+    std::memcpy(&window, reinterpret_cast<const std::uint8_t*>(raw) + (pos >> 3), sizeof(window));
+    return static_cast<std::uint32_t>((window >> (pos & 7)) & ((std::uint64_t{1} << n) - 1));
 }
 
 struct Lane {
@@ -93,9 +93,10 @@ void start(Lane& lane, const StreamQueue& queue, std::size_t i) {
 }
 
 void store(const Lane& lane, StreamQueue& queue) {
+    const auto head{lane.out.acc & (~std::uint64_t{0} >> ((64 - lane.out.fill) & 63))};
     queue.coded[lane.stream] =
         CodedStream{lane.out.out, static_cast<std::size_t>(lane.slot_end - lane.out.out),
-                    lane.out.acc, lane.out.fill};
+                    head, lane.out.fill};
 }
 
 template <typename Step, typename Finish>
@@ -190,16 +191,14 @@ void code_token_streams(const TokenCode& code, StreamQueue& queue) {
         [ans, reverse_map](Lane& lane) {
             --lane.entry;
             const AnsEntryCode c{ans[*lane.entry]};
-            if (c.raw_bits != 0) {
-                lane.raw_pos -= c.raw_bits;
-                lane.out.prepend(read_raw(lane.raw, lane.raw_pos, c.raw_bits), c.raw_bits);
-            }
-            // libjxl PutSymbol. A single-symbol histogram (freq ANS_TAB_SIZE,
-            // identity slot map) leaves the state unchanged.
+            lane.raw_pos -= c.raw_bits;
+            const auto raw{read_raw(lane.raw, lane.raw_pos, c.raw_bits)};
             std::uint32_t x{lane.state};
             const bool renormalize{(x >> (32 - ANS_LOG_TAB_SIZE)) >= c.freq};
-            lane.out.prepend(renormalize ? (x & 0xffff) : 0, renormalize ? 16 : 0);
-            x = renormalize ? x >> 16 : x;
+            const unsigned shift{renormalize ? 16u : 0u};
+            lane.out.prepend((static_cast<std::uint64_t>(raw) << shift) | (renormalize ? x & 0xffff : 0),
+                             c.raw_bits + shift);
+            x >>= shift;
             const auto v{static_cast<std::uint32_t>((x * c.reciprocal) >> RECIPROCAL_PRECISION)};
             lane.state = (v << ANS_LOG_TAB_SIZE) + reverse_map[c.slot + x - v * c.freq];
         },
