@@ -8,9 +8,9 @@ This project is a CUDA port of a JPEG XL encoder, implementing a GPU- and real-t
 
 ## HoloCrop scan encoding
 
-For rendered images on the GPU, pass packed sRGB directly to `cujpegxl_encoder_submit_rgb8`. This preserves full-resolution colour and skips the NV12 conversion.
+Pass packed sRGB on the GPU to `cujpegxl_encoder_submit_rgb8`. This branch preserves the image dimensions, applies centered horizontal 4:2:2 chroma sampling and uses fixed 8×8 transforms. The CropVision scan benchmark uses distance 0.62, three in-flight images per encoder and reusable page-locked host output buffers.
 
-Keep one encoder instance alive across a scan. It builds an initial AC prefix codebook from the first image and samples one in sixteen groups of image blocks on every image. The sampling position rotates. The encoder refreshes the codebook after 2, 4 and 8 images, then every 16 images, giving recent samples more weight. The same schedule updates coefficient order from sampled tiles across the scan. Each JPEG XL file embeds the codebook it uses and decodes independently. Starting a new encoder resets the history.
+Keep one encoder alive per image shape across a scan. It learns an initial AC codebook from the first image, then updates its codebook and coefficient order from subsequent images. Each pipeline slot reuses its uniform quantization field while the dimensions and distance match. Every output embeds its current codebook and can be decoded independently with a standard JPEG XL decoder.
 
 ## Goals
 

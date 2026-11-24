@@ -62,16 +62,18 @@ inline constexpr std::uint32_t ADAPTIVE_FIELD_BINS = 4096;
 // All pointers are device addresses.
 // Deterministic. Enqueues on `stream` without waiting; returns false on a
 // launch error.
+// Set initialize_field to false only when the same buffers still contain the
+// uniform quantizer field for these dimensions and distance.
 bool encode_frontend(const Nv12Textures& image, std::size_t width, std::size_t height,
                      float distance, __half* coeffs, std::int8_t* acs, float* adaptive_field,
                      std::uint32_t* field_histogram, std::int32_t* quant_field,
-                     QuantCalibration* calibration, cudaStream_t stream);
+                     QuantCalibration* calibration, cudaStream_t stream, bool initialize_field = true);
 
 bool encode_rgb_frontend(const std::uint8_t* rgb, std::size_t pitch, std::size_t width,
                          std::size_t height, float distance, __half* coeffs, std::int8_t* acs,
                          float* adaptive_field, std::uint32_t* field_histogram,
                          std::int32_t* quant_field, QuantCalibration* calibration,
-                         cudaStream_t stream);
+                         cudaStream_t stream, bool initialize_field = true);
 
 }  // namespace cujpegxl
 

@@ -182,32 +182,6 @@ __device__ void erode_cells(const float* __restrict__ pre, float* __restrict__ e
     }
 }
 
-// Each thread filters a strip of GAB_STRIP_ROWS outputs in one column, sliding
-// a window of 5-wide input rows held in registers, so each input row is read
-// from shared memory once rather than once per output it contributes to.
-constexpr int GAB_STRIP_ROWS{TILE_SAMPLES / FRONTEND_THREADS};
-static_assert(GAB_STRIP_ROWS * FRONTEND_THREADS == TILE_SAMPLES);
-
-template <typename T>
-__device__ __forceinline__ T gaborish_weight(float w) {
-    if constexpr (std::is_same_v<T, __half2>) {
-        return __float2half2_rn(w);
-    } else {
-        return w;
-    }
-}
-
-// Filters the padded plane `in` of floats, or of half2 channel pairs, and
-// passes each output with its tile index to store(index, value).
-template <typename T, typename Store>
-__device__ void gaborish_tile(const T* __restrict__ in, int tid, Store store) {
-    const int x = tid % TILE_PX;
-    const int y = tid / TILE_PX * GAB_STRIP_ROWS;
-#pragma unroll
-    for (int k=0; k<GAB_STRIP_ROWS; ++k)
-        store((y+k)*TILE_STRIDE+x, in[(y+k+HALO)*PAD+x+HALO]);
-}
-
 // rate_terms[i] = 1 + log2f(1 + i) for 0 < i < RATE_TERMS, and 0 for i = 0.
 __device__ inline void init_rate_terms(float* __restrict__ rate_terms, int tid) {
     if (tid < RATE_TERMS) {
@@ -736,10 +710,6 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
     extern __shared__ __align__(16) unsigned char workspace_bytes[];
     float* workspace{reinterpret_cast<float*>(workspace_bytes)};
     float* sharp_y{workspace};
-    float* sh_y{sharp_y + TILE_FLOATS};
-    float* sh_pre{sh_y + PAD_SAMPLES};
-    float* sh_eroded{sh_pre + CELLS * CELLS};
-    float* sh_red{sh_eroded + CELLS * CELLS};
     float* raw_x{workspace + RESIDENT_X_B_OFFSET};
     float* raw_b{raw_x + PAD_SAMPLES};
     __half2* raw_xb{reinterpret_cast<__half2*>(raw_x)};
@@ -751,28 +721,16 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
     const int tile_bh{static_cast<int>(min(bh - tby0, std::size_t{TB}))};
     const int tid{static_cast<int>(threadIdx.x)};
 
-    // Load the padded tile and compute XYB into shared memory. The fixed trip
-    // count lets the loop unroll fully. The pixels outside the image take the
-    // nearest edge pixel's samples: the luma texture's clamp addressing selects
-    // it, and the chroma coordinates of the pixels before the image filter the
-    // same clamped texels as the first pixel's, while those past it are clamped
-    // to the last pixel's (for odd dimensions they would filter differently).
-    const int gx0{static_cast<int>(tbx0) * 8 - HALO};
-    const int gy0{static_cast<int>(tby0) * 8 - HALO};
+    // With fixed DCT8 and no Gaborish filter, only the tile's own pixels are needed.
+    const int lane = tid % TILE_PX;
+    const int warp = tid / TILE_PX;
+    const int gx = static_cast<int>(tbx0 * 8) + lane;
+    const int gy0 = static_cast<int>(tby0 * 8) + warp;
     const float chroma_x_max{fmaf(static_cast<float>(width - 1), 0.5f, 0.25f)};
     const float chroma_y_max{fmaf(static_cast<float>(height - 1), 0.5f, 0.25f)};
-    // The pixel coordinates of sample i, advanced with i by whole rows and
-    // columns: the column wraps at most once per step, as the step's column
-    // part is below PAD. Integral floats this small add exactly.
-    float gx{static_cast<float>(gx0 + tid % PAD)};
-    float gy{static_cast<float>(gy0 + tid / PAD)};
-    const float gx_end{static_cast<float>(gx0 + PAD)};
 #pragma unroll
-    for (int k{0}; k < (PAD_SAMPLES + FRONTEND_THREADS - 1) / FRONTEND_THREADS; ++k) {
-        const int i{tid + k * FRONTEND_THREADS};
-        if (i >= PAD_SAMPLES) {
-            break;
-        }
+    for (int i = tid; i < TILE_SAMPLES; i += FRONTEND_THREADS) {
+        const int gy = gy0 + (i - tid) / TILE_PX;
         float xo{}, yo{}, bo{};
         if constexpr (std::is_same_v<View, Rgb8View>) {
             int x = min(max(int(gx), 0), int(width) - 1), y = min(max(int(gy), 0), int(height) - 1);
@@ -785,33 +743,20 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
                                          fminf(fmaf(gy, 0.5f, 0.25f), chroma_y_max))};
             nv12_pixel_to_xyb(yv, c.x, c.y, xo, yo, bo);
         }
-        sh_y[i] = yo;
+        sharp_y[(i / TILE_PX) * TILE_STRIDE + lane] = yo;
         if constexpr (HALF2_FRONTEND) {
             raw_xb[i] = __floats2half2_rn(xo, bo);
         } else {
             raw_x[i] = xo;
             raw_b[i] = bo;
         }
-        gx += FRONTEND_THREADS % PAD;
-        gy += FRONTEND_THREADS / PAD;
-        if (gx >= gx_end) {
-            gx -= PAD;
-            gy += 1.0f;
-        }
     }
-    __syncthreads();
-
-    // Pre-erosion cells: 0.25 * sum of the 4x4 pixel diffs (Laplacian of Y).
-    // Warp w takes cell row w, and lane x sums the four terms of tile column x
-    // (in pairs of rows with HALF2_FRONTEND); the four lanes of a cell then combine
-    // their column sums.
-    const int lane{tid % 32};
-    const int warp{tid / 32};
-    if(tid < TB*TB && tid%TB < tile_bw && tid/TB < tile_bh) {
-        adaptive_field[(tby0+tid/TB)*bw+tbx0+tid%TB]=mul_pb;
-        atomicAdd(&field_histogram[field_bin(mul_pb)],1u);
+    if (adaptive_field != nullptr && tid < TB * TB && tid % TB < tile_bw && tid / TB < tile_bh) {
+        adaptive_field[(tby0 + tid / TB) * bw + tbx0 + tid % TB] = mul_pb;
     }
-    gaborish_tile(sh_y, tid, [&](int i, float v) { sharp_y[i] = v; });
+    if (adaptive_field != nullptr && blockIdx.x == 0 && blockIdx.y == 0 && tid == 0) {
+        field_histogram[field_bin(mul_pb)] = static_cast<std::uint32_t>(bw * bh);
+    }
     __syncthreads();
 
     const std::size_t cplane{bw * bh * COEFFS_PER_BLOCK};
@@ -823,15 +768,17 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
 
     float* sharp_x{workspace};
     float* sharp_b{workspace + SHARP_B_OFFSET};
-    if constexpr (HALF2_FRONTEND) {
-        gaborish_tile(raw_xb, tid, [&](int i, __half2 v) {
-            const float2 f{__half22float2(v)};
-            sharp_x[i] = f.x;
-            sharp_b[i] = f.y;
-        });
-    } else {
-        gaborish_tile(raw_x, tid, [&](int i, float v) { sharp_x[i] = v; });
-        gaborish_tile(raw_b, tid, [&](int i, float v) { sharp_b[i] = v; });
+#pragma unroll
+    for (int i = tid; i < TILE_SAMPLES; i += FRONTEND_THREADS) {
+        const int index = (i / TILE_PX) * TILE_STRIDE + lane;
+        if constexpr (HALF2_FRONTEND) {
+            const float2 pair = __half22float2(raw_xb[i]);
+            sharp_x[index] = pair.x;
+            sharp_b[index] = pair.y;
+        } else {
+            sharp_x[index] = raw_x[i];
+            sharp_b[index] = raw_b[i];
+        }
     }
     __syncthreads();
     if constexpr (DCT_MMA) {
@@ -919,7 +866,7 @@ Nv12Textures::~Nv12Textures() {
 template <typename View>
 bool encode_view(View image, std::size_t width, std::size_t height, float distance, __half* coeffs,
                  std::int8_t* acs, float* adaptive_field, std::uint32_t* field_histogram,
-                 std::int32_t* quant_field, QuantCalibration* calibration, cudaStream_t stream) {
+                 std::int32_t* quant_field, QuantCalibration* calibration, cudaStream_t stream, bool initialize_field) {
     const std::size_t bw{padded_to_blocks(width) / 8};
     const std::size_t bh{padded_to_blocks(height) / 8};
     const std::uint32_t blocks{static_cast<std::uint32_t>(bw * bh)};
@@ -956,8 +903,9 @@ bool encode_view(View image, std::size_t width, std::size_t height, float distan
     km2 *= norm;
     km3 *= norm;
 
-    if (cudaMemsetAsync(field_histogram, 0, ADAPTIVE_FIELD_BINS * sizeof(std::uint32_t), stream) !=
-        cudaSuccess) {
+    if (initialize_field &&
+        cudaMemsetAsync(field_histogram, 0, ADAPTIVE_FIELD_BINS * sizeof(std::uint32_t), stream) !=
+            cudaSuccess) {
         return false;
     }
     const dim3 block{FRONTEND_THREADS};
@@ -965,7 +913,10 @@ bool encode_view(View image, std::size_t width, std::size_t height, float distan
                     static_cast<unsigned int>((bh + TB - 1) / TB)};
     frontend_fused_kernel<<<grid, block, WORKSPACE_BYTES, stream>>>(
         image, width, height, bw, bh, km0, km1, km2, km3, mul_pb, add_pb, qgsf, coeffs, acs,
-        adaptive_field, field_histogram);
+        initialize_field ? adaptive_field : nullptr, field_histogram);
+    if (!initialize_field) {
+        return cudaGetLastError() == cudaSuccess;
+    }
     calibrate_field_kernel<<<1, CALIBRATE_THREADS, 0, stream>>>(field_histogram, quant_dc_float,
                                                                 calibration);
     quantize_field_kernel<<<(blocks + FIELD_THREADS - 1) / FIELD_THREADS, FIELD_THREADS, 0,
@@ -976,17 +927,18 @@ bool encode_view(View image, std::size_t width, std::size_t height, float distan
 bool encode_frontend(const Nv12Textures& image, std::size_t width, std::size_t height,
                      float distance, __half* coeffs, std::int8_t* acs, float* adaptive_field,
                      std::uint32_t* field_histogram, std::int32_t* quant_field,
-                     QuantCalibration* calibration, cudaStream_t stream) {
+                     QuantCalibration* calibration, cudaStream_t stream, bool initialize_field) {
     return image.valid() &&
            encode_view(Nv12View{image.luma(), image.chroma()}, width, height, distance, coeffs, acs,
-                       adaptive_field, field_histogram, quant_field, calibration, stream);
+                       adaptive_field, field_histogram, quant_field, calibration, stream,
+                       initialize_field);
 }
 bool encode_rgb_frontend(const std::uint8_t* rgb, std::size_t pitch, std::size_t width,
                          std::size_t height, float distance, __half* coeffs, std::int8_t* acs,
                          float* adaptive_field, std::uint32_t* field_histogram,
                          std::int32_t* quant_field, QuantCalibration* calibration,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, bool initialize_field) {
     return encode_view(Rgb8View{rgb, pitch}, width, height, distance, coeffs, acs, adaptive_field,
-                       field_histogram, quant_field, calibration, stream);
+                       field_histogram, quant_field, calibration, stream, initialize_field);
 }
 }  // namespace cujpegxl

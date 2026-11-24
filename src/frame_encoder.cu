@@ -330,10 +330,11 @@ struct Slot {
 
     std::size_t width{0};
     std::size_t height{0};
+    float field_distance{0};  // A positive distance identifies the resident uniform field.
     std::uint8_t* out_file{nullptr};
     std::size_t out_capacity{0};
     std::vector<StageTiming>* stats{nullptr};
-    uint64_t model_generation{};
+    uint64_t model_generation{UINT64_MAX};
     Clock::time_point entropy_start{};
     EncodeResult result{};
 };
@@ -503,25 +504,17 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
         cudaStreamWaitEvent(slot.stream, slot.input_ready, 0) != cudaSuccess) {
         return false;
     }
-    // The frames' main streams run in submission order: the serial host stage
-    // needs the oldest frame first, and frames sharing the GPU would all
-    // finish late together.
-    if (submitted != 0 &&
-        cudaStreamWaitEvent(slot.stream, slots[(submitted - 1) % depth].ac_complete, 0) !=
-            cudaSuccess) {
-        return false;
-    }
-
     if (!order_model.reserve(sizeof(CoeffOrderStats) + sizeof(CoeffOrders)))
         return false;
     auto* order_history = reinterpret_cast<CoeffOrderStats*>(order_model.data());
     auto* orders = reinterpret_cast<CoeffOrders*>(order_history + 1);
     const auto frontend_start = Clock::now();
+    const bool initialize_field = slot.field_distance != distance;
     bool ready;
     if (chroma == nullptr) {
         ready = encode_rgb_frontend(luma, luma_pitch, slot.width, slot.height, distance, d.coeffs,
                                     d.acs, d.adaptive_field, d.field_histogram, d.quant_field,
-                                    d.calibration, slot.stream);
+                                    d.calibration, slot.stream, initialize_field);
     } else {
         const std::optional<Plane> luma_src{texture_plane(
             {luma, luma_pitch}, slot.width, slot.height, width, d.aligned_luma, slot.stream)};
@@ -536,12 +529,23 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
 
         ready = encode_frontend(*slot.textures, slot.width, slot.height, distance, d.coeffs, d.acs,
                                 d.adaptive_field, d.field_histogram, d.quant_field, d.calibration,
-                                slot.stream);
+                                slot.stream, initialize_field);
     }
-    if (!ready || !quantize_scan_residual(d.coeffs, d.acs, d.quant_field, d.calibration, width,
-                                          height, d.ytox_map, d.ytob_map, d.ac, d.dc, d.nz_exact,
-                                          d.nz_grid, order_history, slot.stream,
-                                          submitted == 0 ? -1 : int(submitted % 16))) {
+    if (!ready) {
+        return false;
+    }
+    slot.field_distance = distance;
+    // Quantization first touches the shared coefficient-order history. The previous
+    // slot stops using the shared model once its code lengths and orders are copied.
+    if (submitted != 0 &&
+        cudaStreamWaitEvent(slot.stream, slots[(submitted - 1) % depth].layout_copied, 0) !=
+            cudaSuccess) {
+        return false;
+    }
+    if (!quantize_scan_residual(d.coeffs, d.acs, d.quant_field, d.calibration, width,
+                                height, d.ytox_map, d.ytob_map, d.ac, d.dc, d.nz_exact,
+                                d.nz_grid, order_history, slot.stream,
+                                submitted == 0 ? -1 : int(submitted % 16))) {
         return false;
     }
     if (slot.stats != nullptr) {
@@ -612,21 +616,27 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
             reinterpret_cast<unsigned*>(order_history), order_words);
         age_histograms<<<(bins + 255) / 256, 256, 0, slot.stream>>>(history, bins);
     }
-    slot.model_generation = generation;
     if (!ac_code_items(d.ac, d.acs, d.nz_grid, d.nz_exact, orders, width, height, history,
                        d.item_sizes, d.token_records, d.ac_counters, arch, slot.stream, model,
                        table, submitted % 16) ||
         !ac_token_layout(d.item_sizes, width, height, d.layout_scratch, d.ac_counters, d.chunk_base,
                          d.layout, reinterpret_cast<uint64_t*>(d.body), slot.stream) ||
-        cudaMemcpyAsync(slot.calibration.data(), d.calibration, sizeof(QuantCalibration),
-                        cudaMemcpyDeviceToHost, slot.stream) != cudaSuccess ||
-        cudaMemcpyAsync(slot.clustering.data(), model, sizeof(AcClustering), cudaMemcpyDeviceToHost,
-                        slot.stream) != cudaSuccess ||
-        // The host reads only the Lehmer codes of the orders.
-        cudaMemcpyAsync(slot.coeff_orders.data()->lehmer, orders->lehmer,
-                        sizeof(CoeffOrders::lehmer), cudaMemcpyDeviceToHost,
-                        slot.stream) != cudaSuccess ||
-        cudaEventRecord(slot.layout_copied, slot.stream) != cudaSuccess) {
+        (initialize_field &&
+         cudaMemcpyAsync(slot.calibration.data(), d.calibration, sizeof(QuantCalibration),
+                         cudaMemcpyDeviceToHost, slot.stream) != cudaSuccess)) {
+        return false;
+    }
+    if (slot.model_generation != generation) {
+        if (cudaMemcpyAsync(slot.clustering.data(), model, sizeof(AcClustering),
+                            cudaMemcpyDeviceToHost, slot.stream) != cudaSuccess ||
+            cudaMemcpyAsync(slot.coeff_orders.data()->lehmer, orders->lehmer,
+                            sizeof(CoeffOrders::lehmer), cudaMemcpyDeviceToHost,
+                            slot.stream) != cudaSuccess) {
+            return false;
+        }
+        slot.model_generation = generation;
+    }
+    if (cudaEventRecord(slot.layout_copied, slot.stream) != cudaSuccess) {
         return false;
     }
 
@@ -760,14 +770,22 @@ bool FrameEncoder::submit(const std::uint8_t* luma, std::size_t luma_pitch,
     Slot& slot{s.slots[s.submitted % s.depth]};
     // The slot's previous frame has completed, but after a failure its device
     // work may still be running.
-    if (cudaSetDevice(s.device) != cudaSuccess || !slot.init() || !slot.wait_idle()) {
+    if (cudaSetDevice(s.device) != cudaSuccess || !slot.init() ||
+        (slot.result.status != EncodeStatus::OK && !slot.wait_idle())) {
         return false;
+    }
+    if (slot.width != width || slot.height != height || slot.result.status != EncodeStatus::OK) {
+        slot.field_distance = 0;
+    }
+    if (slot.result.status != EncodeStatus::OK) {
+        slot.model_generation = UINT64_MAX;
     }
     slot.width = width;
     slot.height = height;
     slot.out_file = out_file;
     slot.out_capacity = out_capacity;
     slot.stats = stats;
+    slot.result = ENCODE_FAILED;
     if (!s.enqueue_frame(slot, luma, luma_pitch, chroma, chroma_pitch, input_stream, distance)) {
         return false;
     }
