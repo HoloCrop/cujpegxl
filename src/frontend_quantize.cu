@@ -320,6 +320,8 @@ __global__ void select_spatial_field(const __half* coeffs, unsigned bw,unsigned 
         field[block]=field[right]=spatial_field[5*m+t];
     }
 }
+// Common signed rounding thresholds, trained on the four development renders.
+__device__ const signed char rounding_shift[720]={0,-36,0,0,-36,0,0,0,0,0,0,0,0,0,35,0,0,35,0,35,0,0,0,0,0,33,30,0,-36,0,0,0,0,0,0,0,0,34,34,0,34,0,0,0,0,0,0,0,0,0,34,0,0,35,36,35,35,0,0,0,0,34,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,0,0,0,36,0,35,0,0,35,36,0,0,36,-38,-38,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-36,0,0,0,0,0,0,0,0,0,0,0,-36,-36,0,-36,0,0,-35,0,0,-34,0,0,-36,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-35,0,0,0,0,0,0,35,0,0,0,0,0,0,0,0,-38,0,35,0,0,0,0,0,0,0,0,0,0,0,35,0,0,0,0,0,0,0,0,0,0,36,0,35,0,0,35,36,36,0,36,-38,-38,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-36,-35,0,-36,0,0,0,0,0,0,0,0,0,-36,0,-36,-36,0,-35,0,0,-35,0,0,-35,-36,0,0,0,0,0,0,0,0,0,0,-36,-35,0,-36,0,0,-35,0,0,0,0,0,0,-36,0,-37,0,0,-36,0,0,-36,0,0,-35,-34,0,-32,0,0,0,0,0,0,0,0,-37,-35,0,0,0,0,0,0,0,0,0,36,0,-38,0,0,0,36,36,0,36,0,-38,0,-37,-34,0,0,0,0,-35,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,37,0,0,37,0,-36,0,0,-37,0,-37,0,0,0,0,0,0,0,0,-35,36,0,0,-37,0,0,0,0,0,0,0,35,35,0,35,36,0,0,-35,0,-35,0,0,-36,0,0,0,0,0,0,0,0,0,0,0,-36,-37,0,0,0,0,0,0,0,-35,0,35,35,-37,36,-37,-37,0,-37,0,0,-36,0,0,-35,-36,0,-37,0,0,0,0,0,0,0,36,0,0,0,0,-38,0,0,0,0,0,0,36,-38,0,0,36,36,37,36,-38,37,-37,-37,0,-37,0,0,0,0,0,0,0,0,0,0,0,0,0,38,0,-37,0,0,-37,0,-33,0,0,-38,0,0,-38,-37,38,36,-37,38,-37,-37,0,-36,-37,0,0,-37,0,0,0,0,0,0,0,36,0,0,0,-38,0,0,0,38,0,0,40,36,36,0,35,36,37,0,0,0,0,0,0,0,0,0,0,0,0,-36,0,0,0,0,0,0,0,0,0,-38,37,0,-39,38,0,0,0,-37,0,0,0,0,37,0,0,0,-37,0,0,0,0,0,0,40,0,0,0,0,0,0,0,0,0,0,0,-38,40,0,-38,0,0,0,36,0,0,0,0,0,0,36,-38,38,-37,-37,0,-37,-37,0,0,40,0,0,40,0,0,0,0,0,0,38,0,-38,40,0,-37,0,0,0,0,-37,0,0,-38,36,38,36,-37,38,36,-37,0,-37,-37,0,0,40,0,0,-38,0,-36,0};
 __global__ void quantize_square(
     const __half* __restrict__ coeffs, const int* __restrict__ quant_field,
     const QuantCalibration* calibration, unsigned bw, unsigned bh, unsigned tiles_x,
@@ -341,6 +343,8 @@ __global__ void quantize_square(
         const unsigned blk=by*bw+bx;
         const unsigned ix=blk*64+entry;
         const float2 y=__half22float2(*reinterpret_cast<const __half2*>(coeffs+plane+ix));
+        const float mean=128.f+255.f*__shfl_sync(~0u,y.x,0);
+        const unsigned brightness=(mean>=8)+(mean>=16)+(mean>=32)+(mean>=96);
         const float y0=entry?y.x*2040.f:0.f, y1=y.y*2040.f;
         float energy=y0*y0+y1*y1;
         for(unsigned i=16;i;i>>=1)energy+=__shfl_xor_sync(~0u,energy,i);
@@ -369,7 +373,13 @@ __global__ void quantize_square(
                     unsigned level=(n>=1)+(n>=2)+(n>=4)+(n>=8)+(n>=16);
                     const float a=fabsf(x[h]);const unsigned m=unsigned(a);const float frac=64*(a-m);
                     const unsigned t=__ldg(&warp_threshold[c][group][min(m,4u)][level][pos]);
-                    const int mag=m+(frac>=(t>>8))-(m!=0 && frac<(t&255));
+                    int mag=m+(frac>=(t>>8))-(m!=0 && frac<(t&255));
+                    const unsigned frequency=pos/8+pos%8;
+                    const unsigned band=(frequency>=3)+(frequency>=6)+(frequency>=9);
+                    const int rule=__ldg(rounding_shift+((((brightness*4+group)*3+c)*4+band)*3+min(mag,2)));
+                    const int phase=__float2int_rd(8.f*(a-float(mag)));
+                    if(rule>0 && phase>=rule-32)++mag;
+                    if(rule<0 && mag && phase<=rule+32)--mag;
                     val[h]=pos==0?0:(x[h]<0?-mag:mag);
                 }
                 *reinterpret_cast<short2*>(ac+c*plane+ix)=make_short2(val[0],val[1]);
