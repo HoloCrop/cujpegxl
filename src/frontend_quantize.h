@@ -58,7 +58,7 @@ bool quantize_residual(const __half* coeffs, const std::int8_t* acs,
                        cudaStream_t stream);
 
 // A nonnegative phase accumulates one in sixteen tiles into the scan history.
-void select_pair_precision(const __half* coeffs,unsigned bw,unsigned bh,int* field,cudaStream_t stream);
+void select_pair_precision(const __half* coeffs,unsigned bw,unsigned bh,int* field,const QuantCalibration* calibration,cudaStream_t stream);
 
 bool quantize_scan_residual(const __half* coeffs, const std::int8_t* acs,
                             const std::int32_t* quant_field, const QuantCalibration* calibration,
