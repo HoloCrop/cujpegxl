@@ -616,8 +616,8 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
             reinterpret_cast<unsigned*>(order_history), order_words);
         age_histograms<<<(bins + 255) / 256, 256, 0, slot.stream>>>(history, bins);
     }
-    if (!ac_code_items(d.ac, d.acs, d.nz_grid, d.nz_exact, orders, width, height, history,
-                       d.item_sizes, d.token_records, d.ac_counters, arch, slot.stream, model,
+    if (!ac_code_fixed8_items(d.ac, d.nz_grid, d.nz_exact, orders, width, height, history,
+                       d.item_sizes, d.token_records, d.ac_counters, slot.stream, model,
                        table, submitted % 16) ||
         !ac_token_layout(d.item_sizes, width, height, d.layout_scratch, d.ac_counters, d.chunk_base,
                          d.layout, reinterpret_cast<uint64_t*>(d.body), slot.stream) ||
@@ -642,7 +642,7 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
 
     auto st = slot.stream;
     auto packed = reinterpret_cast<unsigned*>(d.body);
-    if (!prefix_pack(d.acs, d.token_records, width, height, d.item_sizes, d.chunk_base, d.layout, 0,
+    if (!prefix_pack_fixed8(d.token_records, width, height, d.item_sizes, d.chunk_base, d.layout, 0,
                      num_ac, packed, d.ac_counters, st))
         return false;
     finish_groups<<<dim3(8, num_ac), 128, 0, st>>>(
