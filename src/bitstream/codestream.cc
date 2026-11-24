@@ -77,7 +77,11 @@ void write_frame_header(BitWriter& w) {
     // save_before_color_transform.
     write_u32(w, U32Enc{{Val(0), Bits(4), BitsOffset(5, 16), BitsOffset(10, 48)}},
               0);         // name len 0
-    write_bool(w, true);  // loop_filter all_default = true
+    write_bool(w, false); // explicit loop filter
+    write_bool(w, false); // disable Gaborish
+    write_bits(w, 2, 2); // default EPF
+    write_bits(w, 3, 0); // default sharpness, weights, sigma
+    write_u64(w, 0); // loop filter extensions
     write_u64(w, 0);      // extensions = 0
 }
 

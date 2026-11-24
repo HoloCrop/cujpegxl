@@ -201,31 +201,11 @@ __device__ __forceinline__ T gaborish_weight(float w) {
 // passes each output with its tile index to store(index, value).
 template <typename T, typename Store>
 __device__ void gaborish_tile(const T* __restrict__ in, int tid, Store store) {
-    constexpr int WIDTH{2 * HALO + 1};
-    const int x0{tid % TILE_PX};
-    const int y0{tid / TILE_PX * GAB_STRIP_ROWS};
-    T w[GAB_STRIP_ROWS + 2 * HALO][WIDTH];
+    const int x = tid % TILE_PX;
+    const int y = tid / TILE_PX * GAB_STRIP_ROWS;
 #pragma unroll
-    for (int r{0}; r < GAB_STRIP_ROWS + 2 * HALO; ++r) {
-#pragma unroll
-        for (int c{0}; c < WIDTH; ++c) {
-            w[r][c] = in[(y0 + r) * PAD + x0 + c];
-        }
-    }
-#pragma unroll
-    for (int k{0}; k < GAB_STRIP_ROWS; ++k) {
-        const auto at = [&](int dy, int dx) { return w[k + HALO + dy][HALO + dx]; };
-        const T e{at(0, -1) + at(0, 1) + at(-1, 0) + at(1, 0)};
-        const T r2{at(0, -2) + at(0, 2) + at(-2, 0) + at(2, 0)};
-        const T dg{at(-1, -1) + at(-1, 1) + at(1, -1) + at(1, 1)};
-        const T l8{at(-1, -2) + at(-1, 2) + at(1, -2) + at(1, 2) + at(-2, -1) + at(-2, 1) +
-                   at(2, -1) + at(2, 1)};
-        const T d4{at(-2, -2) + at(-2, 2) + at(2, -2) + at(2, 2)};
-        store((y0 + k) * TILE_STRIDE + x0,
-              gaborish_weight<T>(GAB_WC) * at(0, 0) + gaborish_weight<T>(GAB_WR) * e +
-                  gaborish_weight<T>(GAB_WR2) * r2 + gaborish_weight<T>(GAB_WD) * dg +
-                  gaborish_weight<T>(GAB_WL) * l8 + gaborish_weight<T>(GAB_WD2) * d4);
-    }
+    for (int k=0; k<GAB_STRIP_ROWS; ++k)
+        store((y+k)*TILE_STRIDE+x, in[(y+k+HALO)*PAD+x+HALO]);
 }
 
 // rate_terms[i] = 1 + log2f(1 + i) for 0 < i < RATE_TERMS, and 0 for i = 0.
@@ -336,220 +316,26 @@ __device__ __forceinline__ std::uint32_t select_transforms(float* __restrict__ s
                                                            float qgsf, float lambda,
                                                            std::int8_t* __restrict__ acs,
                                                            __half* __restrict__ y_plane, int tid) {
-    const float* sharp_y{select};
-    float* rows32{select};
-    float* rows16{select + SELECT_ROWS16_OFFSET};
-    float* rows8{select + SELECT_ROWS8_OFFSET};
-    float* cost8{select + SELECT_WORDS_OFFSET};
-    float* cost16{cost8 + 16};
-    float* dist32{cost16 + 4};
-    float* rate32{dist32 + 2};
-    std::uint32_t* layout_word{reinterpret_cast<std::uint32_t*>(rate32 + 2)};
-    float* rate_terms{select + RATE_TERMS_OFFSET};
-    init_rate_terms(rate_terms, tid);
-    const float inv_qgsf{1.0f / qgsf};
-    constexpr float INF{1.0e30f};
-    const int lane{tid % 32};
-    const int warp{tid / 32};
-    const int part32{warp - 6};
-
-    // Horizontal pass, lane r on tile row r. Rows32 overlaps sharp Y, so the
-    // rows are stored once every warp has loaded its pixels.
-    float h[16];
-    std::uint32_t u32[2][4];
-    float offset32;
-    const float* pixel_row{sharp_y + lane * TILE_STRIDE};
-    if (warp < 4) {
-        dct_vector<8, 8>(pixel_row + 8 * warp, 0, h);
-    } else if (warp < 6) {
-        dct_vector<16, 16>(pixel_row + 16 * (warp - 4), 0, h);
-    } else if constexpr (DCT_MMA) {
-        offset32 = dct32_mma_vertical(DCT32_BASIS, sharp_y, TILE_STRIDE, part32, lane, u32);
-    } else {
-        dct_vector<32, 16>(pixel_row, part32, h);
+    const int lane = tid % 32;
+    const int column = tid / 32;
+    float* rows = select + SELECT_ROWS8_OFFSET;
+    if (column < 4) {
+        float values[8];
+        dct_vector<8,8>(select + lane*TILE_STRIDE + column*8, 0, values);
+        float* dst = rows + (4*column + lane/8)*8*9 + lane%8;
+#pragma unroll
+        for(int f=0; f<8; ++f) dst[f*9]=values[f];
     }
     __syncthreads();
-    // Vector (4 cb + rb) * 8 + fx of rows8 holds frequency fx of the rows of
-    // 8x8 block (cb, rb), vector (2 ch + rb) * 16 + fx of rows16 that of 16x16
-    // block (ch, rb), and vector fx of rows32 that of the tile.
-    if (warp < 4) {
-        float* dst{rows8 + (4 * warp + lane / 8) * 8 * 9 + lane % 8};
+    if(column < tile_bw && lane/8 < tile_bh) {
+        float values[8];
+        dct_vector<8,8>(rows + (32*column+lane)*9, 0, values);
 #pragma unroll
-        for (int fx{0}; fx < 8; ++fx) {
-            dst[fx * 9] = h[fx];
-        }
-    } else if (warp < 6) {
-        float* dst{rows16 + (2 * (warp - 4) + lane / 16) * 16 * 17 + lane % 16};
-#pragma unroll
-        for (int fx{0}; fx < 16; ++fx) {
-            dst[fx * 17] = h[fx];
-        }
-    } else if (!DCT_MMA) {
-#pragma unroll
-        for (int m{0}; m < 16; ++m) {
-            rows32[(2 * m + part32) * 33 + lane] = h[m];
-        }
+        for(int f=0; f<8; ++f) values[f]*=DCT2D_SCALE<8>;
+        if(lane%8==0) acs[(rby+lane/8)*bw+rbx+column]=8;
+        store_half8(y_plane+covered_plane_slot(8,rbx+column,rby+lane/8,bw,8*(lane%8)), values);
     }
-    __syncthreads();
-
-    // Vertical pass, lane v on vector 32 w + v of its size (w relative to the
-    // first warp of that size), and the candidates' costs.
-    float c[16];
-    if (warp < 4) {
-        const int rb{lane / 8};
-        const int fx{lane % 8};
-        dct_vector<8, 8>(rows8 + (32 * warp + lane) * 9, 0, c);
-        float dist{0.0f};
-        float rate{0.0f};
-#pragma unroll
-        for (int fy{0}; fy < 8; ++fy) {
-            c[fy] *= DCT2D_SCALE<8>;
-            accumulate_coeff_cost(c[fy], fx, fy, 8, qgsf, inv_qgsf, rate_terms, dist, rate);
-        }
-        dist = lane_group_sum<8>(dist);
-        rate = lane_group_sum<8>(rate);
-        const bool inside{warp < tile_bw && rb < tile_bh};
-        if (fx == 0) {
-            cost8[8 * (rb / 2) + 4 * (warp / 2) + 2 * (rb % 2) + warp % 2] =
-                inside ? candidate_cost(8, dist, rate, lambda) : INF;
-        }
-    } else if (warp < 6) {
-        const int ch{warp - 4};
-        const int rb{lane / 16};
-        const int fx{lane % 16};
-        dct_vector<16, 16>(rows16 + (32 * ch + lane) * 17, 0, c);
-        float dist{0.0f};
-        float rate{0.0f};
-#pragma unroll
-        for (int fy{0}; fy < 16; ++fy) {
-            c[fy] *= DCT2D_SCALE<16>;
-            accumulate_coeff_cost(c[fy], fx, fy, 16, qgsf, inv_qgsf, rate_terms, dist, rate);
-        }
-        dist = lane_group_sum<16>(dist);
-        rate = lane_group_sum<16>(rate);
-        const bool fit16{2 * ch + 2 <= tile_bw && 2 * rb + 2 <= tile_bh};
-        if (fx == 0) {
-            cost16[2 * rb + ch] = fit16 ? candidate_cost(16, dist, rate, lambda) : INF;
-        }
-    } else {
-        if constexpr (DCT_MMA) {
-            dct32_mma_horizontal(DCT32_BASIS, u32, part32, lane, offset32, c);
-        } else {
-            dct_vector<32, 16>(rows32 + lane * 33, part32, c);
-        }
-        float dist{0.0f};
-        float rate{0.0f};
-#pragma unroll
-        for (int m{0}; m < 16; ++m) {
-            // The tensor-core basis includes the scale.
-            if constexpr (!DCT_MMA) {
-                c[m] *= DCT2D_SCALE<32>;
-            }
-            accumulate_coeff_cost(c[m], dct32_lane_fx(lane, m), dct32_lane_fy(part32, lane, m), 32,
-                                  qgsf, inv_qgsf, rate_terms, dist, rate);
-        }
-        dist = lane_group_sum<32>(dist);
-        rate = lane_group_sum<32>(rate);
-        if (lane == 0) {
-            dist32[part32] = dist;
-            rate32[part32] = rate;
-        }
-    }
-    __syncthreads();
-
-    // Lane q < 4 of warp 0 decides quadrant q, whose 8x8 costs are cost8[4 q +
-    // 2 dy + dx]; lane l < 16 then writes the signal of block (l % 4, l / 4).
-    if (warp == 0 && lane < 16) {
-        const int q{lane % 4};
-        const int qbx{2 * (q % 2)};
-        const int qby{2 * (q / 2)};
-        float sum8{0.0f};
-        bool any8{false};
-        for (int dy{0}; dy < 2; ++dy) {
-            for (int dx{0}; dx < 2; ++dx) {
-                if (qbx + dx < tile_bw && qby + dy < tile_bh) {
-                    sum8 += cost8[4 * q + 2 * dy + dx];
-                    any8 = true;
-                }
-            }
-        }
-        const bool fit16{qbx + 2 <= tile_bw && qby + 2 <= tile_bh};
-        const float c16{cost16[q]};
-        int choice{0};
-        float quadrant_cost{0.0f};
-        if (any8) {
-            if (fit16 && c16 <= sum8 + TRANSFORM_SELECT_SPLIT_EPS) {
-                choice = 16;
-                quadrant_cost = c16;
-            } else {
-                choice = 8;
-                quadrant_cost = sum8;
-            }
-        }
-        float split_cost{0.0f};
-        std::uint32_t split_layout{0};
-#pragma unroll
-        for (int i{0}; i < 4; ++i) {
-            split_cost += __shfl_sync(0xffffu, quadrant_cost, i);
-            split_layout |= static_cast<std::uint32_t>(__shfl_sync(0xffffu, choice, i)) << (8 * i);
-        }
-        const bool fit32{tile_bw == TB && tile_bh == TB};
-        const float cost32{
-            candidate_cost(32, dist32[0] + dist32[1], rate32[0] + rate32[1], lambda)};
-        const bool whole32{fit32 && cost32 <= split_cost + TRANSFORM_SELECT_SPLIT_EPS};
-        const int dx{lane % 4};
-        const int dy{lane / 4};
-        const int side{whole32 ? 32 : quadrant_side(split_layout, 2 * (dy / 2) + dx / 2)};
-        // The top-left block of a transform carries its side, the rest of its
-        // footprint ACS_COVERED.
-        if (side != 0 && dx < tile_bw && dy < tile_bh) {
-            const int footprint_mask{side / 8 - 1};
-            acs[(rby + static_cast<std::size_t>(dy)) * bw + rbx + static_cast<std::size_t>(dx)] =
-                (dx & footprint_mask) == 0 && (dy & footprint_mask) == 0
-                    ? static_cast<std::int8_t>(side)
-                    : ACS_COVERED;
-        }
-        if (lane == 0) {
-            *layout_word = whole32 ? WHOLE32_LAYOUT : split_layout;
-        }
-    }
-    __syncthreads();
-    const std::uint32_t layout{*layout_word};
-
-    if (layout == WHOLE32_LAYOUT) {
-        // Gathered in rows32 for coalesced stores, four per thread.
-        if (warp >= 6) {
-#pragma unroll
-            for (int m{0}; m < 16; ++m) {
-                rows32[dct32_lane_fx(lane, m) * 33 + dct32_lane_fy(part32, lane, m)] = c[m];
-            }
-        }
-        __syncthreads();
-        const int e{4 * tid};
-        store_half4(y_plane + covered_plane_slot(32, rbx, rby, bw, static_cast<std::size_t>(e)),
-                    rows32 + (e / 32) * 33 + e % 32);
-    } else if (warp < 4) {
-        const int rb{lane / 8};
-        const int fx{lane % 8};
-        if (quadrant_side(layout, 2 * (rb / 2) + warp / 2) == 8 && warp < tile_bw && rb < tile_bh) {
-            store_half8(y_plane + covered_plane_slot(8, rbx + static_cast<std::size_t>(warp),
-                                                     rby + static_cast<std::size_t>(rb), bw,
-                                                     static_cast<std::size_t>(8 * fx)),
-                        c);
-        }
-    } else if (warp < 6) {
-        const int ch{warp - 4};
-        const int rb{lane / 16};
-        const int fx{lane % 16};
-        if (quadrant_side(layout, 2 * rb + ch) == 16) {
-            __half* dst{y_plane + covered_plane_slot(16, rbx + 2 * static_cast<std::size_t>(ch),
-                                                     rby + 2 * static_cast<std::size_t>(rb), bw,
-                                                     static_cast<std::size_t>(16 * fx))};
-            store_half8(dst, c);
-            store_half8(dst + 8, c + 8);
-        }
-    }
-    return layout;
+    return 0x08080808u;
 }
 
 // Shared-memory index of region entry k (a horizontal-pass row entry or a
@@ -998,123 +784,10 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
     // their column sums.
     const int lane{tid % 32};
     const int warp{tid / 32};
-    {
-        const int lx{lane + HALO};
-        float sum{0.0f};
-        float even_y{};
-        float even_lap{};
-#pragma unroll
-        for (int dy{0}; dy < 4; ++dy) {
-            const int ly{4 * warp + dy + HALO};
-            const float yv{sh_y[ly * PAD + lx]};
-            const float base{0.25f * (sh_y[(ly + 1) * PAD + lx] + sh_y[(ly - 1) * PAD + lx] +
-                                      sh_y[ly * PAD + lx - 1] + sh_y[ly * PAD + lx + 1])};
-            if constexpr (HALF2_FRONTEND) {
-                if (dy % 2 == 0) {
-                    even_y = yv;
-                    even_lap = yv - base;
-                } else {
-                    sum += masking_sqrt_pair_sum(float2{even_y, yv}, float2{even_lap, yv - base});
-                }
-            } else {
-                float diff{ratio_cbrt_gamma<false>(yv + MATCH_GAMMA_OFFSET) * (yv - base)};
-                diff *= diff;
-                diff = fminf(diff, DIFF_LIMIT);
-                sum += masking_sqrt(diff);
-            }
-        }
-        sum += __shfl_xor_sync(0xffffffffu, sum, 1);
-        sum += __shfl_xor_sync(0xffffffffu, sum, 2);
-        if (lane % 4 == 0) {
-            sh_pre[warp * CELLS + lane / 4] = 0.25f * sum;
-        }
+    if(tid < TB*TB && tid%TB < tile_bw && tid/TB < tile_bh) {
+        adaptive_field[(tby0+tid/TB)*bw+tbx0+tid%TB]=mul_pb;
+        atomicAdd(&field_histogram[field_bin(mul_pb)],1u);
     }
-    __syncthreads();
-
-    // The AQ loop below does not read the eroded cells, so the barrier after it
-    // also covers this step.
-    erode_cells(sh_pre, sh_eroded, tid, km0, km1, km2, km3);
-
-    // Adaptive quant integer. Every pixel modulation term is an additive
-    // reduction over the block's 64 pixels, reduced as two half-blocks of four
-    // pixel rows with one warp each; the eight warps take the 32 half-blocks of
-    // the tile in turn. Thread lb then combines block lb's half-block sums and
-    // its four eroded cells.
-    for (int hb{tid / 32}; hb < 2 * TB * TB; hb += FRONTEND_THREADS / 32) {
-        const int lb{hb / 2};
-        const int half{hb % 2};
-        const int lbx{lb % TB};
-        const int lby{lb / TB};
-        if (lbx >= tile_bw || lby >= tile_bh) {
-            continue;
-        }
-        const int fx{lane % 8};
-        const int fy{4 * half + lane / 8};
-        const int idx{(lby * 8 + fy + HALO) * PAD + lbx * 8 + fx + HALO};
-        const float yv{sh_y[idx]};
-        const float2 xb{HALF2_FRONTEND ? __half22float2(raw_xb[idx])
-                                       : float2{raw_x[idx], raw_b[idx]}};
-        const float xv{xb.x};
-        const float bv{xb.y};
-
-        constexpr float valmin{0.0206f};
-        float hf_part{0.0f};
-        if (fx < 7) {
-            hf_part += fminf(valmin, fabsf(yv - sh_y[idx + 1]));
-        }
-        if (fy < 7) {
-            hf_part += fminf(valmin, fabsf(yv - sh_y[idx + PAD]));
-        }
-
-        constexpr float kBias{0.16f};
-        const float iny{yv + kBias};
-        const float gamma_part{HALF2_FRONTEND ? inverse_ratio_cbrt_gamma_sum(iny - xv, iny + xv)
-                                              : ratio_cbrt_gamma<true>(iny - xv) +
-                                                    ratio_cbrt_gamma<true>(iny + xv)};
-
-        constexpr float kLimit{0.027121074570634722f};
-        constexpr float kOffset{0.084381641171960495f};
-        const float pye{yv + kOffset + fabsf(xv)};
-        const float blue_part{bv > pye ? fminf(bv - pye, kLimit) : 0.0f};
-
-        const float red{warp_reduce_sum3(hf_part, gamma_part, blue_part, lane)};
-        if (lane < 24 && lane % 8 == 0) {
-            sh_red[hb * 3 + lane / 8] = red;
-        }
-    }
-    __syncthreads();
-    if (tid < TB * TB) {
-        const int lbx{tid % TB};
-        const int lby{tid / TB};
-        if (lbx < tile_bw && lby < tile_bh) {
-            const float* red{sh_red + tid * 6};
-            const float hf_sum{red[0] + red[3]};
-            const float gamma_overall{(red[1] + red[4]) * (0.5f / 64.0f)};
-            float blue_sum{red[2] + red[5]};
-            const float* eroded{sh_eroded + 2 * lby * CELLS + 2 * lbx};
-            const float aq{(eroded[0] + eroded[CELLS]) + (eroded[1] + eroded[CELLS + 1])};
-
-            constexpr float kLimit{0.027121074570634722f};
-            if (blue_sum >= 32.0f * kLimit) {
-                blue_sum = 64.0f * kLimit - blue_sum;
-            }
-            constexpr float kMaxLimit{15.398788439047934f};
-            if (blue_sum >= kMaxLimit * kLimit) {
-                blue_sum = kMaxLimit * kLimit;
-            }
-
-            float ov{compute_mask(aq)};
-            ov += hf_sum * -0.38f + 0.42f;
-            ov += 0.1005613337192697f * log2f(gamma_overall);
-            ov += blue_sum * 0.14207000358439159f;
-
-            const float qval{expf(ov) * mul_pb + add_pb};
-            adaptive_field[(tby0 + static_cast<std::size_t>(lby)) * bw + tbx0 +
-                           static_cast<std::size_t>(lbx)] = qval;
-            atomicAdd(&field_histogram[field_bin(qval)], 1u);
-        }
-    }
-
     gaborish_tile(sh_y, tid, [&](int i, float v) { sharp_y[i] = v; });
     __syncthreads();
 
