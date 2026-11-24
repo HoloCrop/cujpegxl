@@ -14,12 +14,14 @@
 #define CUJPEGXL_QC_HD
 #endif
 
+#include "device_table.h"
+
 namespace cujpegxl {
 
 // libjxl DC quantization reciprocals (kInvDCQuant), channels ordered X, Y, B to
 // match the quantizer input plane order. DC is quantized with these, separately
 // from the DCT8 AC dequant matrix.
-inline constexpr float DC_INV_QUANT[3] = {4096.0f, 512.0f, 256.0f};
+CUJPEGXL_DEVICE_TABLE constexpr float DC_INV_QUANT[3] = {4096.0f, 512.0f, 256.0f};
 
 // libjxl default base chroma-from-luma Y-to-B correlation (kYToBRatio). The
 // decoder adds dequant_y * Y_TO_B_RATIO to every B coefficient (DC and AC), so

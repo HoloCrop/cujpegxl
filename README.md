@@ -12,6 +12,21 @@ Pass packed sRGB on the GPU to `cujpegxl_encoder_submit_rgb8`. This branch prese
 
 Keep one encoder alive per image shape across a scan. It learns an initial AC codebook from the first image, then updates its codebook and coefficient order from subsequent images. Each pipeline slot reuses its uniform quantization field while the dimensions and distance match. Every output embeds its current codebook and can be decoded independently with a standard JPEG XL decoder.
 
+### PyTorch CUDA tensors
+
+The `torch-cujpegxl` wheel builds the encoder and tensor binding together against PyTorch and the CUDA toolkit. `Encoder` accepts interleaved, uint8 HWC RGB on its CUDA device, including tensors with row padding. It waits on the calling thread's current PyTorch stream and returns independently owned JPEG XL files.
+
+```python
+from torch_cujpegxl import Encoder
+
+height, width, _ = image.shape
+encoder = Encoder(width, height, distance=0.92, device_index=image.device.index)
+file = encoder.encode(image)
+files = encoder.encode_batch(images)  # NHWC tensor or sequence of HWC tensors
+```
+
+For continuous capture, keep the encoder alive and call `push(camera_images)` for each frame. Consume the returned files in submission order and call `flush()` once at the end to receive the tail. Keep submitted pixels unchanged until their file is returned. A flush retains the encoder's scan history.
+
 ## Goals
 
 * Conformance. The encoded image must be readable by any standard-conforming decoder.

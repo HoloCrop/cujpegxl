@@ -19,3 +19,9 @@ eval_dataset/out/
 # Python
 __pycache__/
 *.pyc
+
+# PyTorch extension build products
+/build/
+/dist/
+/*.egg-info/
+__pycache__/

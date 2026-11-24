@@ -62,8 +62,14 @@ cc_test(
 )
 
 cc_library(
+    name = "device_table",
+    hdrs = ["device_table.h"],
+)
+
+cc_library(
     name = "dct_impl",
     hdrs = ["dct_impl.cuh"],
+    deps = [":device_table"],
 )
 
 cc_library(
@@ -181,6 +187,7 @@ cc_library(
     name = "ac_context",
     hdrs = ["ac_context.h"],
     copts = RUNTIME_COPTS,
+    deps = [":device_table"],
 )
 
 cc_library(
@@ -302,6 +309,7 @@ cc_library(
         "quant_weights_dct32.h",
         "quant_weights_dct8.h",
     ],
+    deps = [":device_table"],
 )
 
 cc_binary(
