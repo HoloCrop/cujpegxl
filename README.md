@@ -1,5 +1,11 @@
 # cujpegxl - CUDA-accelerated JPEG XL encoder
 
+## Experimental RAW pipeline profile
+
+This branch records the packed RGB8 encoder evaluated on the RTX 4070 at distance 0.36. The encoder uses native JPEG XL 4:2:2 chroma, fixed 8×8 transforms and a common set of learned coefficient thresholds for apple, grape and cherry. Each output decodes independently with stock djxl. The training objective includes coefficient coding cost, source-domain error, local contrast, RF-DETR sensitivity and frequency-band energy.
+
+The benchmark covers RGB8 renders from native RAW captures. The production wheel remains pinned to its existing revision. NV12, other distances and other GPU architectures have not been qualified for this experimental profile.
+
 ![logo](doc/logo_light.svg)
 
 [![CI](https://github.com/m-pilia/cujpegxl/actions/workflows/ci.yaml/badge.svg)](https://github.com/m-pilia/cujpegxl/actions/workflows/ci.yaml)

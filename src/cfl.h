@@ -27,7 +27,7 @@ namespace cujpegxl {
 inline constexpr int CFL_COLOR_FACTOR = 84;                        // libjxl kDefaultColorFactor
 inline constexpr float CFL_COLOR_SCALE = 1.0f / CFL_COLOR_FACTOR;  // libjxl color_scale_
 inline constexpr float CFL_BASE_X = 0.0f;                          // base_correlation_x
-inline constexpr float CFL_BASE_B = 1.0f;  // base_correlation_b (kYToBRatio)
+inline constexpr float CFL_BASE_B = 0.0f;  // base_correlation_b (kYToBRatio)
 inline constexpr int CFL_MAP_MIN = -128;   // ImageSB (signed int8) range
 inline constexpr int CFL_MAP_MAX = 127;
 

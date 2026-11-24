@@ -32,7 +32,7 @@ constexpr std::size_t DC_BLOB_STRIDE = 256;
 // (num_dc_groups * HISTOGRAM_STRIDE). All work is enqueued on `stream`.
 // Deterministic. Returns false on a CUDA error.
 bool build_dc_group_blobs_device(std::size_t width, std::size_t height,
-                                 const std::uint32_t* d_dc_hist, const std::uint32_t* d_am_hist,
+                                 const std::int32_t* qf, const std::uint32_t* d_dc_hist, const std::uint32_t* d_am_hist,
                                  const std::size_t* d_fbc, std::uint8_t* d_dc_depth,
                                  std::uint16_t* d_dc_bits, std::uint8_t* d_am_depth,
                                  std::uint16_t* d_am_bits, std::uint8_t* d_blob_pre,

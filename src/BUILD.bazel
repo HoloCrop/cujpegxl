@@ -226,7 +226,10 @@ cc_binary(
 
 cuda_library(
     name = "frontend_quantize",
-    srcs = ["frontend_quantize.cu"],
+    srcs = [
+        "frontend_quantize.cu",
+        "spectral_quant_tables.cuh",
+    ],
     hdrs = ["frontend_quantize.h"],
     copts = RUNTIME_COPTS,
     deps = [

@@ -14,8 +14,6 @@
 // production assembler, and the device kernels. Default map: no DC/QF
 // thresholds, so the block context depends only on channel and transform order.
 
-#include "device_table.h"
-
 namespace cujpegxl {
 
 #if defined(__CUDACC__)
@@ -33,19 +31,19 @@ inline constexpr int AC_NUM_CONTEXTS =
 
 // libjxl kDefaultCtxMap: 3 channel groups x kNumOrders, clustering the large
 // transforms together. Row order is the permuted channel index (Y, X, B).
-CUJPEGXL_DEVICE_TABLE constexpr std::uint8_t AC_DEFAULT_CTX_MAP[3 * AC_NUM_ORDERS] = {
+inline constexpr std::uint8_t AC_DEFAULT_CTX_MAP[3 * AC_NUM_ORDERS] = {
     0, 1, 2, 2, 3,  3,  4,  5,  6,  6,  6,  6,  6,   //
     7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,  //
     7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,  //
 };
 
-CUJPEGXL_DEVICE_TABLE constexpr std::uint16_t AC_COEFF_FREQ_CONTEXT[64] = {
+inline constexpr std::uint16_t AC_COEFF_FREQ_CONTEXT[64] = {
     0xBAD, 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17,
     18,    18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25,
     26,    26, 26, 26, 27, 27, 27, 27, 28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30,
 };
 
-CUJPEGXL_DEVICE_TABLE constexpr std::uint16_t AC_COEFF_NUM_NONZERO_CONTEXT[64] = {
+inline constexpr std::uint16_t AC_COEFF_NUM_NONZERO_CONTEXT[64] = {
     0xBAD, 0,   31,  62,  62,  93,  93,  93,  93,  123, 123, 123, 123, 152, 152, 152,
     152,   152, 152, 152, 152, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180,
     180,   206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,

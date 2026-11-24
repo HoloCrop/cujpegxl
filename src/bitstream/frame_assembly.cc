@@ -133,11 +133,22 @@ std::size_t dc_group_count(std::size_t width, std::size_t height) {
 
 std::vector<std::uint8_t> build_dc_global(const QuantParams& qp) {
     BitWriter w{};
-    write_bool(w, true);  // DequantMatrices::DecodeDC all_default
+    write_bool(w,false);write_bits(w,16,14522);write_bits(w,16,14522);write_bits(w,16,14522);
     write_u32(w, GLOBAL_SCALE_ENC, qp.global_scale);
     write_u32(w, QUANT_DC_ENC, qp.quant_dc);  // Quantizer::Decode
-    write_bool(w, true);                      // DecodeBlockCtxMap is_default
-    write_bool(w, true);                      // ColorCorrelation::DecodeDC all_default
+    write_bool(w,false);w.write(4,0);w.write(4,4);
+    constexpr U32Enc thresholds{{Bits(4),BitsOffset(8,16),BitsOffset(16,272),BitsOffset(32,65808)}};
+    for(int v:{-332,-313,-104,25})write_u32(w,thresholds,v<0?(-2*v-1):2*v);
+    w.write(4,0);w.write(4,0);
+    uint8_t contexts[3*13*5];
+    for(unsigned i=0;i<3*13*5;++i)contexts[i]=(i/(13*5))*5+i%5;
+    detail::write_best_prefix_context_map(w,contexts,sizeof(contexts),15);
+    write_bool(w, false); // independent YCbCr planes at DC
+    write_bits(w, 2, 0);
+    write_bits(w, 16, 0);
+    write_bits(w, 16, 0);
+    write_bits(w, 8, 128);
+    write_bits(w, 8, 128);
     write_bool(w, false);                     // modular global has_tree = 0
     w.zero_pad_to_byte();
     return w.bytes();

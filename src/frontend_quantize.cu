@@ -108,6 +108,15 @@ __device__ inline int quantize_deadzone(float steps, float threshold) {
     return fabsf(steps) < threshold ? 0 : round_to_int(steps);
 }
 
+// Choose the smallest number of unit coefficients that recovers at least as
+// much squared-error reduction as scalar quantization in this channel and group.
+__device__ inline int allocate_units(float value, const DequantWeightPair weight, float threshold,
+                                     float quant, float unit) {
+    const float steps = div_rn(value * quant, weight.weight, weight.inv_weight);
+    return isfinite(threshold) ? round_to_int(steps) : 0;
+}
+
+#include "spectral_quant_tables.cuh"
 // LlfDcTerms of every covered block of a DCT16 (entries 0-3) and a DCT32
 // (entries 4-19), row-major in (out_y, out_x).
 constexpr std::uint32_t LLF_DC_TERM_ENTRIES = 20;
@@ -290,302 +299,83 @@ __device__ inline std::uint32_t position_stats_base(const TilePosition& p, std::
 //   in the tile's packed counters, then added to `order_stats`.
 // A warp quantizes the 64 slots of one position per step (two per lane), so
 // the non-zero counts of a step all go to one first-block.
-__global__ void __launch_bounds__(QUANT_THREADS, QUANT_BLOCKS_PER_SM)
-    quantize_tile_kernel(const __half* __restrict__ coeffs, const std::int8_t* __restrict__ acs,
-                         const std::int32_t* __restrict__ quant_field,
-                         const LlfDcTerms* __restrict__ dc_terms, std::uint32_t bw,
-                         std::uint32_t bh, std::uint32_t tiles_x,
-                         const QuantCalibration* __restrict__ calibration,
-                         std::int8_t* __restrict__ ytox_map, std::int8_t* __restrict__ ytob_map,
-                         std::int16_t* __restrict__ ac, std::int32_t* __restrict__ dc,
-                         std::int32_t* __restrict__ nz_exact, std::int32_t* __restrict__ nz_grid,
-                         CoeffOrderStats* __restrict__ order_stats, int sample_phase) {
-    const bool collect = sample_phase < 0 || (blockIdx.x % 16 == unsigned(sample_phase));
-    __shared__ __align__(16) __half tile_coeffs[3][TILE_SLOTS];
-    __shared__ std::uint64_t tile_llf_mask[TILE_POSITIONS];
-    // The owner's quantizer strength and its reciprocal.
-    __shared__ float2 tile_qgsf[TILE_POSITIONS];
-    __shared__ TilePosition tile_pos[TILE_POSITIONS];
-    __shared__ std::int32_t tile_nz[3][TILE_POSITIONS];
-    __shared__ __align__(16) std::uint32_t tile_order_stats[PACKED_ORDER_STATS_WORDS];
-    __shared__ float cfl_warp[3][QUANT_WARPS];
-    __shared__ float cfl_ratio[2];
+__global__ void quantize_square(
+    const __half* __restrict__ coeffs, const int* __restrict__ quant_field,
+    const QuantCalibration* calibration, unsigned bw, unsigned bh, unsigned tiles_x,
+    std::int8_t* ytox, std::int8_t* ytob, short* ac, int* dc, int* nz_exact,
+    int* nz_grid, CoeffOrderStats* order_stats, int sample_phase) {
+    __shared__ unsigned counters[3*16];
+    __shared__ int tile_dc[3][64];
+    __shared__ unsigned char tile_count[3][64];
+    const unsigned tid=threadIdx.x, warp=tid/32, lane=tid%32, entry=2*lane;
+    const unsigned tile=blockIdx.x, bx0=8*(tile%tiles_x), by0=8*(tile/tiles_x);
+    const unsigned blocks=bw*bh, plane=blocks*64;
+    const bool collect=sample_phase<0 || tile%16==unsigned(sample_phase);
+    if(tid==0){ytox[tile]=0;ytob[tile]=0;}
+    if(collect){if(tid<48)counters[tid]=0;__syncthreads();}
+    const float gsf=calibration->global_scale_float, dcscale=gsf*float(calibration->quant_dc);
+    for(unsigned p=warp;p<64;p+=blockDim.x/32){
+        const unsigned bx=bx0+p%8,by=by0+p/8;
+        if(bx>=bw || by>=bh)continue;
+        const unsigned blk=by*bw+bx;
+        const unsigned ix=blk*64+entry;
+        const float2 y=__half22float2(*reinterpret_cast<const __half2*>(coeffs+plane+ix));
+        const float y0=entry?y.x*2040.f:0.f, y1=y.y*2040.f;
+        float energy=y0*y0+y1*y1;
+        for(unsigned i=16;i;i>>=1)energy+=__shfl_xor_sync(~0u,energy,i);
+        const unsigned group=unsigned(energy>64*36)+unsigned(energy>64*196)+unsigned(energy>64*1024);
+        const float scale=float(quant_field[blk])*gsf;
 
-    const std::uint32_t nblk{bw * bh};
-    const std::uint32_t cplane{nblk * BLOCK_SLOTS};
-    const float gsf{calibration->global_scale_float};
-    const float dc_scale{gsf * static_cast<float>(calibration->quant_dc)};
-    const std::uint32_t tid{threadIdx.x};
-    const std::uint32_t warp{tid / 32};
-    const std::uint32_t lane{tid % 32};
 
-    const std::uint32_t tile{blockIdx.x};
-    const std::uint32_t tile_bx{(tile % tiles_x) * TILE_SIDE};
-    const std::uint32_t tile_by{(tile / tiles_x) * TILE_SIDE};
-    const TileFetch fetched{fetch_tile(coeffs, acs, quant_field, bw, bh, cplane, tile_bx, tile_by)};
-    const std::uint32_t cols{min(TILE_SIDE, bw - tile_bx)};
-    const std::uint32_t rows{min(TILE_SIDE, bh - tile_by)};
-
-    // Indexed as a uint4 array: through __half element addresses, clang splits
-    // each vector into two repacked 8-byte stores.
-#pragma unroll
-    for (std::uint32_t i{0}; i < FETCH_VECTORS; ++i) {
-        reinterpret_cast<uint4*>(&tile_coeffs[0][0])[i * QUANT_THREADS + tid] = fetched.coeffs[i];
-    }
-    if (collect && tid < PACKED_ORDER_STATS_VECTORS) {
-        reinterpret_cast<uint4*>(tile_order_stats)[tid] = make_uint4(0, 0, 0, 0);
-    }
-    TilePosition pos{};
-    if (tid < TILE_POSITIONS) {
-        const std::uint32_t lx{tid % TILE_SIDE};
-        const std::uint32_t ly{tid / TILE_SIDE};
-        const std::uint32_t lane32{(ly & ~3u) % 4 * TILE_SIDE + (lx & ~3u)};
-        const std::uint32_t lane16{(ly & ~1u) % 4 * TILE_SIDE + (lx & ~1u)};
-        const std::int32_t acs32{__shfl_sync(~0u, fetched.acs, lane32)};
-        const std::int32_t acs16{__shfl_sync(~0u, fetched.acs, lane16)};
-        const std::uint32_t side{acs32 == 32 ? 32u : (acs16 == 16 ? 16u : 8u)};
-        const std::uint32_t owner_lane{side == 32 ? lane32 : (side == 16 ? lane16 : lane)};
-        const std::int32_t owner_qf{__shfl_sync(~0u, fetched.quant_field, owner_lane)};
-        const std::uint32_t owner{warp * 32 + owner_lane};
-        const std::uint32_t m{side / 8};
-        const std::uint32_t covered_ordinal{(ly - owner / TILE_SIDE) * m +
-                                            (lx - owner % TILE_SIDE)};
-        pos = TilePosition{static_cast<std::uint8_t>(owner), static_cast<std::uint8_t>(side),
-                           static_cast<std::uint8_t>(covered_ordinal)};
-        const bool in_frame{lx < cols && ly < rows};
-        tile_pos[tid] = pos;
-        tile_llf_mask[tid] = in_frame ? llf_slot_mask(side, covered_ordinal) : ~std::uint64_t{0};
-        const float qgsf{static_cast<float>(owner_qf) * gsf};
-        tile_qgsf[tid] = make_float2(qgsf, 1.0f / qgsf);
-        for (std::uint32_t c{0}; c < 3; ++c) {
-            tile_nz[c][tid] = 0;
-        }
-    }
-    __syncthreads();
-
-    {
-        const std::uint32_t slot{tid % BLOCK_SLOTS};
-        const std::uint32_t row{tid / BLOCK_SLOTS};
-        float sxy{0.0f};
-        float syy{0.0f};
-        float sby{0.0f};
-#pragma unroll
-        for (std::uint32_t p{row * TILE_SIDE}; p < (row + 1) * TILE_SIDE; ++p) {
-            if (!((tile_llf_mask[p] >> slot) & 1)) {
-                const std::uint32_t at{p * BLOCK_SLOTS + slot};
-                const float xr{__half2float(tile_coeffs[0][at])};
-                const float yr{__half2float(tile_coeffs[1][at])};
-                const float br{__half2float(tile_coeffs[2][at])};
-                sxy += xr * yr;
-                syy += yr * yr;
-                sby += (br - CFL_BASE_B * yr) * yr;
-            }
-        }
-        for (std::uint32_t s{16}; s > 0; s >>= 1) {
-            sxy += __shfl_xor_sync(~0u, sxy, s);
-            syy += __shfl_xor_sync(~0u, syy, s);
-            sby += __shfl_xor_sync(~0u, sby, s);
-        }
-        if (lane == 0) {
-            cfl_warp[0][warp] = sxy;
-            cfl_warp[1][warp] = syy;
-            cfl_warp[2][warp] = sby;
-        }
-    }
-
-    // One DC per thread: warps 0-3 take Y in lanes 0-15 and B in lanes 16-31
-    // of 16 positions each (B is predicted from the Y DC of its position),
-    // warps 4-5 take X of 32 positions each.
-    if (tid < 3 * TILE_POSITIONS) {
-        const bool y_or_b{tid < 2 * TILE_POSITIONS};
-        const std::uint32_t p{y_or_b ? warp * 16 + lane % 16 : tid - 2 * TILE_POSITIONS};
-        const std::uint32_t c{y_or_b ? (lane < 16 ? 1u : 2u) : 0u};
-        const bool in_frame{p % TILE_SIDE < cols && p / TILE_SIDE < rows};
-        const TilePosition dc_pos{tile_pos[p]};
-        float value{__half2float(tile_coeffs[c][p * BLOCK_SLOTS])};
-        const std::uint32_t m{static_cast<std::uint32_t>(dc_pos.side) / 8};
-        if (in_frame && m > 1) {
-            const std::uint32_t olx{dc_pos.owner % TILE_SIDE};
-            const std::uint32_t oly{dc_pos.owner / TILE_SIDE};
-            const LlfDcTerms& w{
-                dc_terms[llf_dc_term_entry(m, p % TILE_SIDE - olx, p / TILE_SIDE - oly)]};
-            value = 0.0f;
-            for (std::uint32_t fx{0}; fx < m; ++fx) {
-                for (std::uint32_t fy{0}; fy < m; ++fy) {
-                    const std::size_t at{covered_plane_slot(dc_pos.side, olx, oly, TILE_SIDE,
-                                                            fx * dc_pos.side + fy)};
-                    value += w.w[fx * m + fy] * __half2float(tile_coeffs[c][at]);
+        #pragma unroll
+        for(unsigned c=0;c<3;++c){
+            const float2 v=c==1?y:__half22float2(*reinterpret_cast<const __half2*>(coeffs+c*plane+ix));
+            if(lane==0)tile_dc[c][p]=round_to_int(v.x*(DC_INV_QUANT[c]*dcscale));
+            unsigned nz=0;
+            if(c==1 || (bx&1)==0){
+                const auto weights=lane_weight_pairs(c,entry);
+                const float2 base=__ldg(reinterpret_cast<const float2*>(tr_base_half[c]+entry));
+                const uint4 suffix=__ldg(reinterpret_cast<const uint4*>(tr_suffix[c]+entry));
+                float x[2];unsigned mask[2];short val[2];
+                for(unsigned h=0;h<2;++h){
+                    const auto wt=weights.slot[h];
+                    x[h]=div_rn((h?v.y:v.x)*scale,wt.weight,wt.inv_weight);
+                    mask[h]=__ballot_sync(~0u,entry+h!=0 && fabsf(x[h])>=(h?base.y:base.x));
                 }
+                for(unsigned h=0;h<2;++h){
+                    const unsigned pos=entry+h;
+                    unsigned n=__popc(mask[0]&(h?suffix.z:suffix.x))+__popc(mask[1]&(h?suffix.w:suffix.y));
+                    unsigned level=(n>=1)+(n>=2)+(n>=4)+(n>=8)+(n>=16);
+                    const float a=fabsf(x[h]);const unsigned m=unsigned(a);const float frac=64*(a-m);
+                    const unsigned t=__ldg(&warp_threshold[c][group][min(m,4u)][level][pos]);
+                    const int mag=m+(frac>=(t>>8))-(m!=0 && frac<(t&255));
+                    val[h]=pos==0?0:(x[h]<0?-mag:mag);
+                }
+                *reinterpret_cast<short2*>(ac+c*plane+ix)=make_short2(val[0],val[1]);
+                nz=__popc(__ballot_sync(~0u,val[0]!=0))+__popc(__ballot_sync(~0u,val[1]!=0));
+                if(collect)count_lane_nonzeros(counters,64*c,lane,val[0]!=0,val[1]!=0);
             }
-        }
-
-        const float dcq{DC_INV_QUANT[c] * dc_scale};
-        int qdc{round_to_int(value * dcq)};
-        if (y_or_b) {
-            const int qdc_y{__shfl_xor_sync(~0u, qdc, 16)};
-            if (c == 2) {
-                const float y_dc_round{static_cast<float>(qdc_y) / (DC_INV_QUANT[1] * dc_scale)};
-                qdc = round_to_int((value - CFL_BASE_B * y_dc_round) * dcq);
-            }
-        }
-        if (in_frame) {
-            const std::uint32_t blk{(tile_by + p / TILE_SIDE) * bw + tile_bx + p % TILE_SIDE};
-            dc[c * nblk + blk] = qdc;
-        }
-    }
-
-    float y_round[QUANT_STEPS][2];
-#pragma unroll
-    for (std::uint32_t k{0}; k < QUANT_STEPS; ++k) {
-        const std::uint32_t p{k * QUANT_WARPS + warp};
-        if (p % TILE_SIDE >= cols || p / TILE_SIDE >= rows) {
-            continue;
-        }
-        const TilePosition at_pos{tile_pos[p]};
-        const float2 qgsf{tile_qgsf[p]};
-        const std::uint32_t entry{
-            table_entry(at_pos.side, at_pos.covered_ordinal * BLOCK_SLOTS + 2 * lane)};
-        const LaneWeightPairs wy{lane_weight_pairs(1, entry)};
-        const LaneThresholds thresholds{lane_thresholds(1, entry)};
-        std::int16_t qy[2];
-        bool nonzero[2];
-#pragma unroll
-        for (std::uint32_t j{0}; j < 2; ++j) {
-            const float yr{__half2float(tile_coeffs[1][p * BLOCK_SLOTS + 2 * lane + j])};
-            const int qy_int{quantize_deadzone(
-                div_rn(yr * qgsf.x, wy.slot[j].weight, wy.slot[j].inv_weight), thresholds.slot[j])};
-            y_round[k][j] = div_rn(static_cast<float>(qy_int) * wy.slot[j].weight, qgsf.x, qgsf.y);
-            qy[j] = static_cast<std::int16_t>(qy_int);
-            nonzero[j] = qy_int != 0;
-        }
-        const std::uint32_t blk{(tile_by + p / TILE_SIDE) * bw + tile_bx + p % TILE_SIDE};
-        *reinterpret_cast<short2*>(&ac[cplane + blk * BLOCK_SLOTS + 2 * lane]) =
-            make_short2(qy[0], qy[1]);
-        const int nz{__popc(__ballot_sync(~0u, nonzero[0])) +
-                     __popc(__ballot_sync(~0u, nonzero[1]))};
-        if (lane == 0 && nz != 0) {
-            atomicAdd(&tile_nz[1][at_pos.owner], nz);
-        }
-        if (collect)
-            count_lane_nonzeros(tile_order_stats, position_stats_base(at_pos, 1), lane, nonzero[0],
-                                nonzero[1]);
-    }
-    __syncthreads();
-
-    if (warp == 0) {
-        float sxy{lane < QUANT_WARPS ? cfl_warp[0][lane] : 0.0f};
-        float syy{lane < QUANT_WARPS ? cfl_warp[1][lane] : 0.0f};
-        float sby{lane < QUANT_WARPS ? cfl_warp[2][lane] : 0.0f};
-        for (std::uint32_t s{QUANT_WARPS / 2}; s > 0; s >>= 1) {
-            sxy += __shfl_xor_sync(~0u, sxy, s);
-            syy += __shfl_xor_sync(~0u, syy, s);
-            sby += __shfl_xor_sync(~0u, sby, s);
-        }
-        if (lane == 0) {
-            int mx{0};
-            int mb{0};
-            cfl_maps_from_sums(sxy, syy, sby, &mx, &mb);
-            ytox_map[tile] = static_cast<std::int8_t>(mx);
-            ytob_map[tile] = static_cast<std::int8_t>(mb);
-            cfl_ratio[0] = cfl_ytox_ratio(mx);
-            cfl_ratio[1] = cfl_ytob_ratio(mb);
+            if(lane==0)tile_count[c][p]=nz;
         }
     }
     __syncthreads();
-
-    const float ytox{cfl_ratio[0]};
-    const float ytob{cfl_ratio[1]};
-#pragma unroll
-    for (std::uint32_t k{0}; k < QUANT_STEPS; ++k) {
-        const std::uint32_t p{k * QUANT_WARPS + warp};
-        if (p % TILE_SIDE >= cols || p / TILE_SIDE >= rows) {
-            continue;
-        }
-        const TilePosition at_pos{tile_pos[p]};
-        const float qgsf{tile_qgsf[p].x};
-        const std::uint32_t entry{
-            table_entry(at_pos.side, at_pos.covered_ordinal * BLOCK_SLOTS + 2 * lane)};
-        // XYB frame header signals one 1.25x quantization step for X and B.
-        const float chroma_quant = 1.25f * qgsf;
-        const LaneWeightPairs wx{lane_weight_pairs(0, entry)};
-        const LaneWeightPairs wb{lane_weight_pairs(2, entry)};
-        const LaneThresholds thresholds{lane_thresholds(0, entry)};
-        std::int16_t qx[2];
-        std::int16_t qb[2];
-        bool nonzero_x[2];
-        bool nonzero_b[2];
-#pragma unroll
-        for (std::uint32_t j{0}; j < 2; ++j) {
-            const std::uint32_t at{p * BLOCK_SLOTS + 2 * lane + j};
-            const float xr{__half2float(tile_coeffs[0][at])};
-            const float br{__half2float(tile_coeffs[2][at])};
-            const int qx_int{quantize_deadzone(div_rn((xr - ytox * y_round[k][j]) * chroma_quant,
-                                                      wx.slot[j].weight, wx.slot[j].inv_weight),
-                                               thresholds.slot[j])};
-            const int qb_int{quantize_deadzone(div_rn((br - ytob * y_round[k][j]) * chroma_quant,
-                                                      wb.slot[j].weight, wb.slot[j].inv_weight),
-                                               thresholds.slot[j])};
-            qx[j] = static_cast<std::int16_t>(qx_int);
-            qb[j] = static_cast<std::int16_t>(qb_int);
-            nonzero_x[j] = qx_int != 0;
-            nonzero_b[j] = qb_int != 0;
-        }
-        const std::uint32_t blk{(tile_by + p / TILE_SIDE) * bw + tile_bx + p % TILE_SIDE};
-        *reinterpret_cast<short2*>(&ac[blk * BLOCK_SLOTS + 2 * lane]) = make_short2(qx[0], qx[1]);
-        *reinterpret_cast<short2*>(&ac[2 * cplane + blk * BLOCK_SLOTS + 2 * lane]) =
-            make_short2(qb[0], qb[1]);
-        const int nz_x{__popc(__ballot_sync(~0u, nonzero_x[0])) +
-                       __popc(__ballot_sync(~0u, nonzero_x[1]))};
-        const int nz_b{__popc(__ballot_sync(~0u, nonzero_b[0])) +
-                       __popc(__ballot_sync(~0u, nonzero_b[1]))};
-        if (lane == 0 && nz_x != 0) {
-            atomicAdd(&tile_nz[0][at_pos.owner], nz_x);
-        }
-        if (lane == 1 && nz_b != 0) {
-            atomicAdd(&tile_nz[2][at_pos.owner], nz_b);
-        }
-        if (collect)
-            count_lane_nonzeros(tile_order_stats, position_stats_base(at_pos, 0), lane,
-                                nonzero_x[0], nonzero_x[1]);
-        if (collect)
-            count_lane_nonzeros(tile_order_stats, position_stats_base(at_pos, 2), lane,
-                                nonzero_b[0], nonzero_b[1]);
-    }
-    __syncthreads();
-
-    const bool first_block{tid < TILE_POSITIONS && tid % TILE_SIDE < cols &&
-                           tid / TILE_SIDE < rows && pos.owner == tid};
-    if (tid < TILE_POSITIONS && tid % TILE_SIDE < cols && tid / TILE_SIDE < rows) {
-        const std::uint32_t m{static_cast<std::uint32_t>(pos.side) / 8};
-        const std::uint32_t covered{m * m};
-        const std::uint32_t log2_covered{m == 4 ? 4u : (m == 2 ? 2u : 0u)};
-        const std::uint32_t blk{(tile_by + tid / TILE_SIDE) * bw + tile_bx + tid % TILE_SIDE};
-        for (std::uint32_t c{0}; c < 3; ++c) {
-            const std::uint32_t nz{static_cast<std::uint32_t>(tile_nz[c][pos.owner])};
-            nz_exact[c * nblk + blk] = first_block ? static_cast<std::int32_t>(nz) : 0;
-            nz_grid[c * nblk + blk] = static_cast<std::int32_t>((nz + covered - 1) >> log2_covered);
+    if(tid<192){
+        const unsigned c=tid/64,p=tid%64;
+        const unsigned bx=bx0+p%8,by=by0+p/8;
+        if(bx<bw&&by<bh){
+            const int ydc=tile_dc[1][p];const int lumaclass=(ydc>-332)+(ydc>-313)+(ydc>-104)+(ydc>25);
+            const unsigned dst=c*blocks+by*bw+bx,nz=tile_count[c][p];
+            dc[dst]=tile_dc[c][p];nz_grid[dst]=int(nz);
+            nz_exact[dst]=int(nz|(((c<2?c^1:2)*5+lumaclass)<<16));
         }
     }
-    if (!collect)
-        return;
-    if (first_block) {
-        count_order_stat(
-            tile_order_stats,
-            static_cast<std::uint32_t>(offsetof(CoeffOrderStats, blocks) / sizeof(std::uint32_t) +
-                                       coeff_order_side_index(pos.side)));
-    }
-    __syncthreads();
-
-    // The counters past ORDER_STATS_WORDS stay 0.
-    auto* const order_stats_words{reinterpret_cast<std::uint32_t*>(order_stats)};
-    for (std::uint32_t w{tid}; w < PACKED_ORDER_STATS_WORDS; w += QUANT_THREADS) {
-        const std::uint32_t packed{tile_order_stats[w]};
-        for (std::uint32_t b{0}; b < 4; ++b) {
-            const std::uint32_t count{(packed >> (b * 8)) & 0xff};
-            if (count != 0) {
-                atomicAdd(&order_stats_words[4 * w + b], count);
-            }
+    if(collect){
+        if(tid<192){
+            const unsigned c=tid/64, k=tid%64;
+            const unsigned n=(counters[tid/4]>>(8*(tid%4)))&255;
+            if(n)atomicAdd(reinterpret_cast<unsigned*>(order_stats)+coeff_order_offset(8,c)+k,n);
         }
+        if(tid==0)atomicAdd(&order_stats->blocks[coeff_order_side_index(8)],min(8u,bw-bx0)*min(8u,bh-by0));
     }
 }
 
@@ -599,20 +389,13 @@ bool quantize_scan_residual(const __half* coeffs, const std::int8_t* acs,
                             CoeffOrderStats* order_stats, cudaStream_t stream, int sample_phase) {
     const std::size_t bw{width / 8};
     const std::size_t bh{height / 8};
-    const LlfDcTerms* dc_terms{llf_dc_terms_device()};
-    if (dc_terms == nullptr) {
-        return false;
-    }
     const std::uint32_t tiles_x{static_cast<std::uint32_t>(ceil_div(bw, TILE_SIDE))};
     const std::uint32_t tiles{tiles_x * static_cast<std::uint32_t>(ceil_div(bh, TILE_SIDE))};
     if (sample_phase < 0 &&
         cudaMemsetAsync(order_stats, 0, sizeof(CoeffOrderStats), stream) != cudaSuccess) {
         return false;
     }
-    quantize_tile_kernel<<<tiles, QUANT_THREADS, 0, stream>>>(
-        coeffs, acs, quant_field, dc_terms, static_cast<std::uint32_t>(bw),
-        static_cast<std::uint32_t>(bh), tiles_x, calibration, ytox_map, ytob_map, ac, dc, nz_exact,
-        nz_grid, order_stats, sample_phase);
+    quantize_square<<<tiles,256,0,stream>>>(coeffs,quant_field,calibration,bw,bh,tiles_x,ytox_map,ytob_map,ac,dc,nz_exact,nz_grid,order_stats,sample_phase);
     return cudaGetLastError() == cudaSuccess;
 }
 

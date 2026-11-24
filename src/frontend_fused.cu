@@ -25,29 +25,63 @@
 namespace cujpegxl {
 namespace {
 
-// One CUDA block transforms a 32-by-32 tile of pixels.
+// Tile geometry: one CUDA block processes TB x TB image blocks. The shared XYB
+// region carries the two-pixel halo required by gaborish. The pre-erosion map is
+// at 4x-subsampled resolution (CELLS x CELLS cells).
+constexpr int HALO = 2;
 constexpr int TB = 4;
 constexpr int TILE_PX = TB * 8;
+constexpr int PAD = TILE_PX + 2 * HALO;
 constexpr int CELLS = 2 * TB;
 constexpr int TILE_SAMPLES = TILE_PX * TILE_PX;
 // The DCT horizontal pass has the lanes of a warp read different tile rows at
 // the same column; the odd row stride maps them to distinct shared-memory banks.
 constexpr int TILE_STRIDE = TILE_PX + 1;
 constexpr int TILE_FLOATS = TILE_PX * TILE_STRIDE;
+constexpr int PAD_SAMPLES = PAD * PAD;
 constexpr int FRONTEND_THREADS = 256;
 // The pre-erosion takes one cell row per warp and one tile column per lane.
 static_assert(FRONTEND_THREADS == 32 * CELLS && TILE_PX == 32);
 // The erosion takes four lanes per cell.
 static_assert(FRONTEND_THREADS == 4 * CELLS * CELLS);
-// Luma rows share their scratch with the chroma pass after the Y transform.
-constexpr int SELECT_ROWS8_OFFSET = TILE_FLOATS;
+// The raw X and B planes stay resident from the load to the X/B gaborish at
+// RESIDENT_X_B_OFFSET; the buffers local to each phase lie below them. With
+// HALF2_FRONTEND they are one plane of half2 (X, B) pairs.
+constexpr std::size_t LOAD_AQ_LOCAL_PEAK =
+    TILE_FLOATS + PAD_SAMPLES + 2 * CELLS * CELLS + 6 * TB * TB;
+// The selection's horizontal-pass rows of each candidate size N start at sharp
+// Y, which they overlap, with vector v at v * (N + 1): the lanes of a warp
+// reading consecutive vectors hit distinct banks. The selection words follow:
+// the 8x8 and 16x16 costs, the 32x32 partial distortions and rates, and the
+// region layout. Then the rate terms of the quantized magnitudes below
+// RATE_TERMS (see accumulate_coeff_cost).
+constexpr int SELECT_ROWS16_OFFSET = 32 * (32 + 1);
+constexpr int SELECT_ROWS8_OFFSET = SELECT_ROWS16_OFFSET + 64 * (16 + 1);
+constexpr int SELECT_WORDS_OFFSET = SELECT_ROWS8_OFFSET + 128 * (8 + 1);
+constexpr std::size_t SELECT_WORDS = 16 + 4 + 2 * 2 + 1;
 constexpr int RATE_TERMS = 128;
-constexpr std::size_t REGION_ROWS_FLOATS = TILE_SAMPLES + TILE_SAMPLES / 32;
-constexpr std::size_t ROWS_B_OFFSET = REGION_ROWS_FLOATS + 8;
-constexpr std::size_t CHROMA_OFFSET = TILE_FLOATS + 128 * 9;
-constexpr std::size_t CHROMA_B_OFFSET = TILE_FLOATS + 16;
-static_assert(ROWS_B_OFFSET + REGION_ROWS_FLOATS <= CHROMA_OFFSET);
-constexpr std::size_t WORKSPACE_FLOATS = CHROMA_OFFSET + CHROMA_B_OFFSET + TILE_FLOATS;
+constexpr std::size_t RATE_TERMS_OFFSET = SELECT_WORDS_OFFSET + SELECT_WORDS;
+constexpr std::size_t REGION_LOCAL_PEAK = RATE_TERMS_OFFSET + RATE_TERMS;
+// The X/B horizontal-pass rows and coefficients, padded by region_row_index.
+constexpr int REGION_ROWS_FLOATS = TILE_SAMPLES + TILE_SAMPLES / 32;
+constexpr std::size_t RESIDENT_X_B_OFFSET = std::max(LOAD_AQ_LOCAL_PEAK, REGION_LOCAL_PEAK);
+// The X/B pass holds sharp X and B below the raw planes, its horizontal-pass
+// rows in the raw planes once gaborish has consumed them, and its coefficients
+// in the sharp planes once the horizontal pass has consumed those.
+// Warps that pair X and B lanes read distinct banks: the horizontal pass reads
+// 16 consecutive rows per channel, so sharp B starts 16 banks after sharp X;
+// the DCT16 vertical pass reads and writes 16 vectors per channel on 16 banks
+// with a gap of 8 after each 8, so the B rows and coefficients start 8 (mod 16)
+// banks after the X ones.
+constexpr std::size_t SHARP_B_OFFSET = TILE_FLOATS + 16;
+static_assert(SHARP_B_OFFSET % 32 == 16 && SHARP_B_OFFSET + TILE_FLOATS <= RESIDENT_X_B_OFFSET);
+constexpr int ROWS_B_SKEW = 8;
+static_assert((PAD_SAMPLES + ROWS_B_SKEW) % 16 == 8);
+static_assert(REGION_ROWS_FLOATS + ROWS_B_SKEW <= PAD_SAMPLES);
+constexpr std::size_t COEFFS_B_OFFSET = SHARP_B_OFFSET + 8;
+static_assert(COEFFS_B_OFFSET % 16 == 8 && REGION_ROWS_FLOATS <= SHARP_B_OFFSET &&
+              COEFFS_B_OFFSET + REGION_ROWS_FLOATS <= RESIDENT_X_B_OFFSET);
+constexpr std::size_t WORKSPACE_FLOATS = RESIDENT_X_B_OFFSET + 2 * PAD_SAMPLES;
 constexpr std::size_t WORKSPACE_BYTES = WORKSPACE_FLOATS * sizeof(float);
 // Resident blocks per SM. sm_61 has 96 KB of shared memory per SM, and 4 blocks
 // leave 64 registers per thread. sm_87 has 164 KB, minus 1 KB reserved per
@@ -155,6 +189,24 @@ __device__ inline void init_rate_terms(float* __restrict__ rate_terms, int tid) 
     }
 }
 
+struct LumaCostWeight {
+    DequantWeightPair weight;
+    float threshold;
+};
+
+template<int N> struct LumaCostWeights { LumaCostWeight values[N*N]; };
+
+template<int N>
+constexpr LumaCostWeights<N> luma_cost_weights(const DequantWeightPairs<N*N>& weights) {
+    LumaCostWeights<N> result{};
+    for (int i=0; i<N*N; ++i) result.values[i] = {weights.w[1][i], ac_deadzone(N,1).threshold(i)};
+    return result;
+}
+
+__device__ LumaCostWeights<8> costs8{luma_cost_weights<8>(DCT8_DEQUANT_PAIRS)};
+__device__ LumaCostWeights<16> costs16{luma_cost_weights<16>(DCT16_DEQUANT_PAIRS)};
+__device__ LumaCostWeights<32> costs32{luma_cost_weights<32>(DCT32_DEQUANT_PAIRS)};
+
 // Rate-distortion contribution of one Y candidate coefficient quantized with the
 // nearest DCT8 weight; the LLF corner is excluded.
 __device__ inline void accumulate_coeff_cost(float coeff, int fx, int fy, int n, float qgsf,
@@ -164,13 +216,11 @@ __device__ inline void accumulate_coeff_cost(float coeff, int fx, int fy, int n,
     if (fx < m && fy < m) {
         return;
     }
-    // Nearest DCT8 position, ties away from zero.
-    int sx{(fx * 8 + n / 2) / n};
-    int sy{(fy * 8 + n / 2) / n};
-    sx = sx > 7 ? 7 : sx;
-    sy = sy > 7 ? 7 : sy;
-    const DequantWeightPair w{DCT8_DEQUANT_PAIRS.w[1][sx * 8 + sy]};
-    const float q{rintf(div_rn(coeff * qgsf, w.weight, w.inv_weight))};
+    const int index = fx * n + fy;
+    const auto entry = n == 8 ? costs8.values[index] : n == 16 ? costs16.values[index] : costs32.values[index];
+    const DequantWeightPair w = entry.weight;
+    const float steps = div_rn(coeff * qgsf, w.weight, w.inv_weight);
+    const float q = fabsf(steps) < entry.threshold ? 0.0f : rintf(steps);
     const float err{div_rn(q * w.weight, qgsf, inv_qgsf) - coeff};
     dist += err * err;
     const float mag{fabsf(q)};
@@ -645,25 +695,16 @@ __device__ void rgb422_to_xyb(Rgb8View image, int x, int y, int width,
                               float& out_x, float& out_y, float& out_b) {
     const auto* row = reinterpret_cast<const uchar3*>(image.pixels + size_t(y) * image.pitch);
     const auto sample = [&](int column) { return row[min(max(column, 0), width - 1)]; };
-    const auto luma = [](uchar3 pixel) {
-        return 0.299f * pixel.x + 0.587f * pixel.y + 0.114f * pixel.z;
-    };
-    const auto chroma = [&](int first) {
-        const auto a = sample(first);
-        const auto b = sample(first + 1);
-        const float gray = (luma(a) + luma(b)) * 0.5f;
-        return make_float2((a.x + b.x) * 0.5f - gray, (a.z + b.z) * 0.5f - gray);
-    };
-    const int pair = x & ~1;
-    const auto center = chroma(pair);
-    const auto neighbor = chroma(pair + ((x & 1) ? 2 : -2));
-    const float red = fmaf(0.25f, neighbor.x - center.x, center.x);
-    const float blue = fmaf(0.25f, neighbor.y - center.y, center.y);
-    const float gray = luma(row[x]);
-    constexpr float unit = 1.0f / 255.0f;
-    linear_rgb_to_xyb(srgb_to_linear(clamp01((gray + red) * unit)),
-                      srgb_to_linear(clamp01((gray - (0.299f * red + 0.114f * blue) / 0.587f) * unit)),
-                      srgb_to_linear(clamp01((gray + blue) * unit)), out_x, out_y, out_b);
+    const auto pixel=sample(x);
+    const int yy=(19595*pixel.x+38470*pixel.y+7471*pixel.z+32768)>>16;
+    const int pair=(x&~15)+2*(x&7);
+    const auto cb=[](uchar3 v){return (32768*v.z-11059*v.x-21709*v.y+8421375)>>16;};
+    const auto cr=[](uchar3 v){return (32768*v.x-27439*v.y-5329*v.z+8421375)>>16;};
+    const auto a=sample(pair), b=sample(pair+1);
+    const int bias=1;
+    out_x=(x&8)?0.f:(((cb(a)+cb(b)+bias)/2)-128)*(1.f/255.f);
+    out_b=(x&8)?0.f:(((cr(a)+cr(b)+bias)/2)-128)*(1.f/255.f);
+    out_y=(yy-128)*(1.f/255.f);
 }
 
 template <typename View>
@@ -676,10 +717,9 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
     extern __shared__ __align__(16) unsigned char workspace_bytes[];
     float* workspace{reinterpret_cast<float*>(workspace_bytes)};
     float* sharp_y{workspace};
-    float* sharp_x{workspace + CHROMA_OFFSET};
-    float* sharp_b{sharp_x + CHROMA_B_OFFSET};
-    float* rows_x{workspace};
-    float* rows_b{workspace + ROWS_B_OFFSET};
+    float* raw_x{workspace + RESIDENT_X_B_OFFSET};
+    float* raw_b{raw_x + PAD_SAMPLES};
+    __half2* raw_xb{reinterpret_cast<__half2*>(raw_x)};
 
     const std::size_t tbx0{static_cast<std::size_t>(blockIdx.x) * TB};
     const std::size_t tby0{static_cast<std::size_t>(blockIdx.y) * TB};
@@ -710,15 +750,12 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
                                          fminf(fmaf(gy, 0.5f, 0.25f), chroma_y_max))};
             nv12_pixel_to_xyb(yv, c.x, c.y, xo, yo, bo);
         }
-        const int index = (i / TILE_PX) * TILE_STRIDE + lane;
-        sharp_y[index] = yo;
+        sharp_y[(i / TILE_PX) * TILE_STRIDE + lane] = yo;
         if constexpr (HALF2_FRONTEND) {
-            const float2 chroma = __half22float2(__floats2half2_rn(xo, bo));
-            sharp_x[index] = chroma.x;
-            sharp_b[index] = chroma.y;
+            raw_xb[i] = __floats2half2_rn(xo, bo);
         } else {
-            sharp_x[index] = xo;
-            sharp_b[index] = bo;
+            raw_x[i] = xo;
+            raw_b[i] = bo;
         }
     }
     if (adaptive_field != nullptr && tid < TB * TB && tid % TB < tile_bw && tid / TB < tile_bh) {
@@ -733,19 +770,38 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
     const std::uint32_t layout{select_transforms(workspace, tbx0, tby0, bw, tile_bw, tile_bh, qgsf,
                                                  TRANSFORM_SELECT_LAMBDA, acs, coeffs + cplane,
                                                  tid)};
-    // All warps must finish reading Y before reusing its scratch for chroma.
+    // Sharp B overlaps the selection rows.
+    __syncthreads();
+
+    float* sharp_x{workspace};
+    float* sharp_b{workspace + SHARP_B_OFFSET};
+#pragma unroll
+    for (int i = tid; i < TILE_SAMPLES; i += FRONTEND_THREADS) {
+        const int index = (i / TILE_PX) * TILE_STRIDE + lane;
+        if constexpr (HALF2_FRONTEND) {
+            const float2 pair = __half22float2(raw_xb[i]);
+            sharp_x[index] = pair.x;
+            sharp_b[index] = pair.y;
+        } else {
+            sharp_x[index] = raw_x[i];
+            sharp_b[index] = raw_b[i];
+        }
+    }
     __syncthreads();
     if constexpr (DCT_MMA) {
-        region_coeffs_mma({sharp_x, sharp_b}, layout, {rows_x, rows_b}, warp, lane);
+        // The coefficients go to the raw planes, which gaborish has consumed.
+        region_coeffs_mma({sharp_x, sharp_b}, layout, {raw_x, raw_b}, warp, lane);
         __syncthreads();
-        store_region_coeffs({rows_x, rows_b}, layout, tbx0, tby0, bw, tile_bw, tile_bh,
+        store_region_coeffs({raw_x, raw_b}, layout, tbx0, tby0, bw, tile_bw, tile_bh,
                             {coeffs, coeffs + 2 * cplane}, tid);
     } else {
-        region_rows({sharp_x, sharp_b}, {rows_x, rows_b}, layout, tile_bw, tile_bh, warp, lane);
+        float* rows_b{raw_b + ROWS_B_SKEW};
+        float* coeffs_b{workspace + COEFFS_B_OFFSET};
+        region_rows({sharp_x, sharp_b}, {raw_x, rows_b}, layout, tile_bw, tile_bh, warp, lane);
         __syncthreads();
-        region_coeffs({rows_x, rows_b}, layout, tile_bw, tile_bh, {sharp_x, sharp_b}, warp, lane);
+        region_coeffs({raw_x, rows_b}, layout, tile_bw, tile_bh, {sharp_x, coeffs_b}, warp, lane);
         __syncthreads();
-        store_region_coeffs({sharp_x, sharp_b}, layout, tbx0, tby0, bw, tile_bw, tile_bh,
+        store_region_coeffs({sharp_x, coeffs_b}, layout, tbx0, tby0, bw, tile_bw, tile_bh,
                             {coeffs, coeffs + 2 * cplane}, tid);
     }
 }

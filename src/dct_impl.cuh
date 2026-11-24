@@ -21,14 +21,12 @@
 // with adjacent outputs added. The two halves are independent, so they can be
 // computed by different threads with the same result.
 
-#include "device_table.h"
-
 namespace cujpegxl {
 
 constexpr float DCT_SQRT2{1.41421356237309504880f};
 
 // 1 / (2 cos(pi (i + 0.5) / N)), i < N/2, for N = 4, 8, 16, 32 at offset N/2 - 2.
-CUJPEGXL_DEVICE_TABLE constexpr float DCT_ODD_MULTIPLIERS[30]{
+constexpr float DCT_ODD_MULTIPLIERS[30]{
     0.54119610014619701f, 1.3065629648763764f,  0.50979557910415918f, 0.60134488693504529f,
     0.89997622313641557f, 2.5629154477415055f,  0.50241928618815568f, 0.52249861493968885f,
     0.56694403481635769f, 0.64682178335999008f, 0.7881546234512502f,  1.0606776859903471f,

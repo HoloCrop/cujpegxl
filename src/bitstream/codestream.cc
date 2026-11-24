@@ -40,10 +40,15 @@ void write_codestream_headers(BitWriter& w, std::uint32_t xsize, std::uint32_t y
     w.write(8, 0xFF);
     w.write(8, 0x0A);
     write_size_header(w, xsize, ysize);
-    // ImageMetadata all_default: 8-bit int samples, xyb_encoded, enumerated
-    // sRGB, no extra channels, default tone mapping -> the whole bundle is one
-    // "all default" bit.
-    write_bool(w, true);
+    write_bool(w,false); // explicit ImageMetadata
+    write_bool(w,false); // no extra fields
+    write_bool(w,false); // integer samples
+    write_bits(w,2,0);   // eight bits per sample
+    write_bool(w,true);  // 16-bit modular buffers suffice
+    write_bits(w,2,0);   // no extra channels
+    write_bool(w,false); // no XYB transform
+    write_bool(w,true);  // sRGB
+    write_u64(w,0);      // metadata extensions
     // CustomTransformData (transform_data) always follows ImageMetadata in the
     // codestream; the default opsin inverse matrix and upsampling weights are
     // one "all default" bit.
@@ -58,12 +63,10 @@ void write_frame_header(BitWriter& w) {
     write_bool(w, false);                                       // all_default = false
     write_u32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, 0);  // frame_type = kRegularFrame
     write_bool(w, false);                                       // is_modular = false -> kVarDCT
-    write_u64(w, 0);                                            // flags
-    // xyb_encoded forces color_transform = kXYB (nothing written).
-    write_u32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);  // upsampling = 1
-    // encoding == kVarDCT && color_transform == kXYB:
-    write_bits(w, 3, 3);  // x_qm_scale: one step above neutral
-    write_bits(w, 3, 3);  // b_qm_scale: one step above neutral
+    write_u64(w, 128); // skip adaptive DC smoothing
+    write_bool(w,true); // YCbCr
+    write_bits(w,6,8); // Y has twice the horizontal sampling of Cb and Cr
+    write_bits(w,2,0); // upsampling = 1
     // passes (frame_type != kReferenceOnly):
     write_u32(w, U32Enc{{Val(1), Val(2), Val(3), BitsOffset(3, 4)}}, 1);  // num_passes = 1
     // frame_type != kDCFrame:
@@ -79,8 +82,7 @@ void write_frame_header(BitWriter& w) {
               0);         // name len 0
     write_bool(w, false); // explicit loop filter
     write_bool(w, false); // disable Gaborish
-    write_bits(w, 2, 2); // default EPF
-    write_bits(w, 3, 0); // default sharpness, weights, sigma
+    write_bits(w, 2, 0); // no EPF
     write_u64(w, 0); // loop filter extensions
     write_u64(w, 0);      // extensions = 0
 }
