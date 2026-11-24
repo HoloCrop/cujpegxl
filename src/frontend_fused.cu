@@ -700,6 +700,32 @@ struct Rgb8View {
     const std::uint8_t* pixels;
     std::size_t pitch;
 };
+// Match centered horizontal 4:2:2 chroma sampling before the RGB-to-XYB transform.
+__device__ void rgb422_to_xyb(Rgb8View image, int x, int y, int width,
+                              float& out_x, float& out_y, float& out_b) {
+    const auto* row = reinterpret_cast<const uchar3*>(image.pixels + size_t(y) * image.pitch);
+    const auto sample = [&](int column) { return row[min(max(column, 0), width - 1)]; };
+    const auto luma = [](uchar3 pixel) {
+        return 0.299f * pixel.x + 0.587f * pixel.y + 0.114f * pixel.z;
+    };
+    const auto chroma = [&](int first) {
+        const auto a = sample(first);
+        const auto b = sample(first + 1);
+        const float gray = (luma(a) + luma(b)) * 0.5f;
+        return make_float2((a.x + b.x) * 0.5f - gray, (a.z + b.z) * 0.5f - gray);
+    };
+    const int pair = x & ~1;
+    const auto center = chroma(pair);
+    const auto neighbor = chroma(pair + ((x & 1) ? 2 : -2));
+    const float red = fmaf(0.25f, neighbor.x - center.x, center.x);
+    const float blue = fmaf(0.25f, neighbor.y - center.y, center.y);
+    const float gray = luma(row[x]);
+    constexpr float unit = 1.0f / 255.0f;
+    linear_rgb_to_xyb(srgb_to_linear(clamp01((gray + red) * unit)),
+                      srgb_to_linear(clamp01((gray - (0.299f * red + 0.114f * blue) / 0.587f) * unit)),
+                      srgb_to_linear(clamp01((gray + blue) * unit)), out_x, out_y, out_b);
+}
+
 template <typename View>
 __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPILED_ARCH])
     frontend_fused_kernel(View image, std::size_t width, std::size_t height, std::size_t bw,
@@ -750,10 +776,7 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
         float xo{}, yo{}, bo{};
         if constexpr (std::is_same_v<View, Rgb8View>) {
             int x = min(max(int(gx), 0), int(width) - 1), y = min(max(int(gy), 0), int(height) - 1);
-            auto pixel = reinterpret_cast<const uchar3*>(image.pixels + size_t(y) * image.pitch)[x];
-            constexpr float unit = 1.f / 255.f;
-            linear_rgb_to_xyb(srgb_to_linear(pixel.x * unit), srgb_to_linear(pixel.y * unit),
-                              srgb_to_linear(pixel.z * unit), xo, yo, bo);
+            rgb422_to_xyb(image, x, y, int(width), xo, yo, bo);
         } else {
             // Point sampling at an integral coordinate reads that texel.
             const float yv{tex2D<float>(image.luma, gx, gy)};

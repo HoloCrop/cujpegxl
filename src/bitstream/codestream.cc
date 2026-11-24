@@ -62,8 +62,8 @@ void write_frame_header(BitWriter& w) {
     // xyb_encoded forces color_transform = kXYB (nothing written).
     write_u32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);  // upsampling = 1
     // encoding == kVarDCT && color_transform == kXYB:
-    write_bits(w, 3, 2);  // x_qm_scale = 2 (neutral)
-    write_bits(w, 3, 2);  // b_qm_scale = 2 (neutral)
+    write_bits(w, 3, 3);  // x_qm_scale: one step above neutral
+    write_bits(w, 3, 3);  // b_qm_scale: one step above neutral
     // passes (frame_type != kReferenceOnly):
     write_u32(w, U32Enc{{Val(1), Val(2), Val(3), BitsOffset(3, 4)}}, 1);  // num_passes = 1
     // frame_type != kDCFrame:

@@ -505,6 +505,8 @@ __global__ void __launch_bounds__(QUANT_THREADS, QUANT_BLOCKS_PER_SM)
         const float qgsf{tile_qgsf[p].x};
         const std::uint32_t entry{
             table_entry(at_pos.side, at_pos.covered_ordinal * BLOCK_SLOTS + 2 * lane)};
+        // XYB frame header signals one 1.25x quantization step for X and B.
+        const float chroma_quant = 1.25f * qgsf;
         const LaneWeightPairs wx{lane_weight_pairs(0, entry)};
         const LaneWeightPairs wb{lane_weight_pairs(2, entry)};
         const LaneThresholds thresholds{lane_thresholds(0, entry)};
@@ -517,10 +519,10 @@ __global__ void __launch_bounds__(QUANT_THREADS, QUANT_BLOCKS_PER_SM)
             const std::uint32_t at{p * BLOCK_SLOTS + 2 * lane + j};
             const float xr{__half2float(tile_coeffs[0][at])};
             const float br{__half2float(tile_coeffs[2][at])};
-            const int qx_int{quantize_deadzone(div_rn((xr - ytox * y_round[k][j]) * qgsf,
+            const int qx_int{quantize_deadzone(div_rn((xr - ytox * y_round[k][j]) * chroma_quant,
                                                       wx.slot[j].weight, wx.slot[j].inv_weight),
                                                thresholds.slot[j])};
-            const int qb_int{quantize_deadzone(div_rn((br - ytob * y_round[k][j]) * qgsf,
+            const int qb_int{quantize_deadzone(div_rn((br - ytob * y_round[k][j]) * chroma_quant,
                                                       wb.slot[j].weight, wb.slot[j].inv_weight),
                                                thresholds.slot[j])};
             qx[j] = static_cast<std::int16_t>(qx_int);
