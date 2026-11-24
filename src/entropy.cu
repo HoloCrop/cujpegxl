@@ -1075,6 +1075,116 @@ __global__ void __launch_bounds__(HISTOGRAM_LAUNCH[COMPILED_ARCH].threads)
     }
 }
 
+__device__ inline unsigned encode_word(const unsigned char* trained_map,
+                                       const unsigned* trained_table, unsigned context,
+                                       unsigned symbol, unsigned bits, unsigned& n) {
+    unsigned c = __ldg(trained_table + __ldg(trained_map + context) * 256 + symbol);
+    unsigned depth = (c >> 16) & 255;
+    n = depth + (c >> 24);
+    return (1u << n) | (bits << depth) | (c & 65535);
+}
+__global__ void __launch_bounds__(HISTOGRAM_LAUNCH[COMPILED_ARCH].threads)
+    packed_item_kernel(const std::int16_t* ac, const std::int8_t* acs, const std::int32_t* nz_grid,
+                       const std::int32_t* nz_exact, const std::uint16_t* orders, std::size_t bw,
+                       std::size_t bh, std::size_t nblocks, std::uint32_t* context_histograms,
+                       unsigned long long* item_sizes, std::uint32_t* token_records,
+                       unsigned int* chunk_counter, const unsigned char* trained_map,
+                       const unsigned* trained_table, unsigned phase) {
+    __shared__ unsigned warp_buffer[HISTOGRAM_LAUNCH[COMPILED_ARCH].threads];
+    unsigned* buffer = warp_buffer + (threadIdx.x / 32) * 32;
+    const unsigned int lane{threadIdx.x % 32};
+    // Item indices, block indices and slot offsets within 32 bits, like the
+    // layout's token offsets.
+    const auto bw32{static_cast<std::uint32_t>(bw)};
+    const auto total{static_cast<std::uint32_t>(3 * bw * bh)};
+    for (;;) {
+        unsigned int claimed{0};
+        if (lane == 0) {
+            claimed = atomicAdd(chunk_counter, 1u);
+        }
+        const bool sample = ((claimed + phase) % 16) == 0;
+        const std::uint32_t base{__shfl_sync(~0u, claimed, 0) * 32};
+        if (base >= total) {
+            break;
+        }
+        const std::uint32_t idx{base + lane};
+        const std::uint32_t block{idx / 3};
+        const int side{idx < total ? (acs == nullptr ? 8 : acs[block]) : ACS_COVERED};
+        const int c{CHANNEL_ORDER[idx % 3]};
+        std::uint32_t nzeros{0};
+        std::uint32_t raw_bits{0}, first_word{0};
+        if (side != ACS_COVERED) {
+            const std::uint32_t bx{block % bw32};
+            const std::uint32_t by{block / bw32};
+            nzeros =
+                static_cast<std::uint32_t>(nz_exact[static_cast<std::size_t>(c) * nblocks + block]);
+            std::uint32_t symbol{}, nbits{}, bits{}, context{};
+            ac_count_token(side, c, ac_predicted_nzeros_dev(nz_grid, c, nblocks, bw, bx, by),
+                           nzeros, symbol, nbits, bits, context);
+            if (sample)
+                atomicAdd(context_histograms + context * 64 + symbol, 1u);
+            first_word = encode_word(trained_map, trained_table, context, symbol, bits, nbits);
+            first_word ^= 1u << nbits;
+            token_records[(static_cast<size_t>(c) * nblocks + block) * 64] = first_word;
+            raw_bits = nbits;
+        }
+        unsigned int pending{__ballot_sync(~0u, side != ACS_COVERED && nzeros != 0)};
+        while (pending != 0) {
+            const int src{__ffs(pending) - 1};
+            pending &= pending - 1;
+            const std::uint32_t item_block{__shfl_sync(~0u, block, src)};
+            const int item_side{__shfl_sync(~0u, side, src)};
+            const int item_c{__shfl_sync(~0u, c, src)};
+            const std::uint32_t item_nzeros{__shfl_sync(~0u, nzeros, src)};
+            const std::size_t item_slot{(static_cast<std::size_t>(item_c) * nblocks + item_block) *
+                                        COEFFS_PER_BLOCK};
+            std::uint32_t* const item_records{token_records + item_slot};
+            // Each warp packs one transform. Carry the unfinished word into its next 32 tokens.
+            unsigned carry = __shfl_sync(~0u, first_word, src);
+            unsigned fill = __shfl_sync(~0u, raw_bits, src);
+            unsigned words = 0;
+            warp_for_each_coeff_token(
+                ac + item_slot, orders, item_side, bw32, item_c, item_nzeros, lane,
+                [&](bool active, std::uint32_t symbol, std::uint32_t nbits, std::uint32_t bits,
+                    std::uint32_t context) {
+                    unsigned n = 0, v = 0;
+                    if (active) {
+                        if (sample)
+                            atomicAdd(context_histograms + context * 64 + symbol, 1u);
+                        unsigned code =
+                            encode_word(trained_map, trained_table, context, symbol, bits, n);
+                        v = code ^ (1u << n);
+                    }
+                    buffer[lane] = lane == 0 ? carry : 0;
+                    __syncwarp();
+                    unsigned end = warp_inclusive_sum(n, lane);
+                    unsigned pos = fill + end - n;
+                    if (v)
+                        atomicOr(buffer + pos / 32, v << (pos % 32));
+                    if (pos % 32 + n > 32)
+                        atomicOr(buffer + pos / 32 + 1, v >> (32 - pos % 32));
+                    __syncwarp();
+                    unsigned total_bits = fill + __shfl_sync(~0u, end, 31);
+                    unsigned full = total_bits / 32;
+                    if (lane < full)
+                        item_records[covered_slot_offset(item_side, bw32, words + lane)] =
+                            buffer[lane];
+                    carry = buffer[full];
+                    fill = total_bits % 32;
+                    words += full;
+                    __syncwarp();
+                });
+            if (lane == 0 && fill)
+                item_records[covered_slot_offset(item_side, bw32, words)] = carry;
+            if (lane == unsigned(src))
+                raw_bits = words * 32 + fill;
+        }
+        if (idx < total) {
+            item_sizes[idx] = pack_sizes(0, raw_bits);
+        }
+    }
+}
+
 // An AC group's items are split into 32-item chunks (AC_GROUP_CHUNKS chunk
 // slots per group; slots past a partial group's items are empty). The chunk
 // sizes, scanned within each group and then over the groups, place every
@@ -1333,6 +1443,62 @@ __global__ void __launch_bounds__(AC_CHUNK_THREADS, AC_PACK_MIN_BLOCKS)
         }
         ac_pack_chunk(group_begin * AC_GROUP_CHUNKS + claimed, acs, token_records, bw, bh, nblocks,
                       xg, context_map, item_sizes, chunk_base, layout, num_groups, entries, raw);
+    }
+}
+
+__device__ void prefix_pack_chunk(std::size_t q, const std::int8_t* acs,
+                                  const std::uint32_t* token_records, std::size_t bw,
+                                  std::size_t bh, std::size_t nblocks, std::size_t xg,
+                                  const unsigned long long* item_sizes,
+                                  const unsigned long long* chunk_base, const std::uint32_t* layout,
+                                  std::size_t num_groups, unsigned* packed) {
+    const std::size_t g{q / AC_GROUP_CHUNKS};
+    const GroupExtent e{group_extent(g, bw, bh, xg)};
+    const unsigned int lane{threadIdx.x % 32};
+    const std::size_t i{(q % AC_GROUP_CHUNKS) * 32 + lane};
+    unsigned n = 0, src = 0;
+    int side = 8;
+    if (i < e.gbw * e.gbh * 3) {
+        size_t b = i / 3;
+        size_t block = (e.by0 + b / e.gbw) * bw + e.bx0 + b % e.gbw;
+        n = item_sizes[block * 3 + i % 3] >> 32;
+        side = acs[block];
+        src = (CHANNEL_ORDER[i % 3] * nblocks + block) * 64;
+    }
+    unsigned start = unsigned(chunk_base[q] >> 32) + warp_inclusive_sum(n, lane) - n;
+    packed += layout[num_groups + 1 + g] * 2;
+    for (unsigned k = 0; k * 32 < n; ++k) {
+        unsigned v = token_records[src + covered_slot_offset(side, bw, k)];
+        unsigned b = start % 32;
+        if (v)
+            atomicOr(packed + start / 32 + k, v << b);
+        if (b && (v >> (32 - b)))
+            atomicOr(packed + start / 32 + k + 1, v >> (32 - b));
+    }
+}
+
+// Chunk costs vary widely and a thread block holds its slot until its slowest
+// warp ends, so the warps of a one-wave grid claim chunks from a counter
+// instead of taking fixed ones. Every chunk's output positions are precomputed,
+// so the claim order does not change the output.
+__global__ void __launch_bounds__(AC_CHUNK_THREADS, AC_PACK_MIN_BLOCKS)
+    prefix_pack_kernel(const std::int8_t* acs, const std::uint32_t* token_records, std::size_t bw,
+                       std::size_t bh, std::size_t nblocks, std::size_t xg, std::size_t group_begin,
+                       std::size_t group_end, const unsigned long long* item_sizes,
+                       const unsigned long long* chunk_base, const std::uint32_t* layout,
+                       std::size_t num_groups, unsigned* packed, unsigned int* chunk_counter) {
+    const std::size_t num_chunks{(group_end - group_begin) * AC_GROUP_CHUNKS};
+    for (;;) {
+        unsigned int claimed{0};
+        if (threadIdx.x % 32 == 0) {
+            claimed = atomicAdd(chunk_counter, 1u);
+        }
+        claimed = __shfl_sync(~0u, claimed, 0);
+        if (claimed >= num_chunks) {
+            return;
+        }
+        prefix_pack_chunk(group_begin * AC_GROUP_CHUNKS + claimed, acs, token_records, bw, bh,
+                          nblocks, xg, item_sizes, chunk_base, layout, num_groups, packed);
     }
 }
 
@@ -1880,6 +2046,63 @@ bool ac_pack_tokens(const std::int8_t* acs, const std::uint32_t* token_records, 
         reinterpret_cast<const unsigned long long*>(chunk_base), layout, num_groups, entries,
         reinterpret_cast<unsigned long long*>(raw),
         counters + pack_counter(num_groups, group_begin));
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool prefix_pack(const std::int8_t* acs, const std::uint32_t* token_records, std::size_t width,
+                 std::size_t height, const std::uint64_t* item_sizes,
+                 const std::uint64_t* chunk_base, const std::uint32_t* layout,
+                 std::size_t group_begin, std::size_t group_end, unsigned* packed,
+                 std::uint32_t* counters, cudaStream_t stream) {
+    const std::size_t bw{width / 8};
+    const std::size_t bh{height / 8};
+    const std::size_t xg{(bw + AC_GROUP_BLOCKS - 1) / AC_GROUP_BLOCKS};
+    const std::size_t num_groups{ac_num_groups(width, height)};
+    std::size_t wave{0};
+    if (!one_wave_blocks(&prefix_pack_kernel, AC_CHUNK_THREADS, 0, wave)) {
+        return false;
+    }
+    const std::size_t num_chunks{(group_end - group_begin) * AC_GROUP_CHUNKS};
+    const std::size_t chunks_per_cta{AC_CHUNK_THREADS / 32};
+    prefix_pack_kernel<<<static_cast<unsigned int>(
+                             std::min(wave, (num_chunks + chunks_per_cta - 1) / chunks_per_cta)),
+                         AC_CHUNK_THREADS, 0, stream>>>(
+        acs, token_records, bw, bh, bw * bh, xg, group_begin, group_end,
+        reinterpret_cast<const unsigned long long*>(item_sizes),
+        reinterpret_cast<const unsigned long long*>(chunk_base), layout, num_groups, packed,
+        counters + pack_counter(num_groups, group_begin));
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool ac_code_items(const std::int16_t* ac, const std::int8_t* acs, const std::int32_t* nz_grid,
+                   const std::int32_t* nz_exact, const CoeffOrders* orders, std::size_t width,
+                   std::size_t height, std::uint32_t* context_histograms, std::uint64_t* item_sizes,
+                   std::uint32_t* token_records, std::uint32_t* counters, GpuArch arch,
+                   cudaStream_t stream, const AcClustering* model, const unsigned* table,
+                   unsigned phase) {
+    ensure_constants();
+    const HistogramLaunch& launch{HISTOGRAM_LAUNCH[arch]};
+    const std::size_t bw{width / 8};
+    const std::size_t bh{height / 8};
+    const std::size_t nblocks{bw * bh};
+    if (cudaMemsetAsync(counters, 0, ac_counter_words(width, height) * sizeof(std::uint32_t),
+                        stream) != cudaSuccess) {
+        return false;
+    }
+    const std::size_t shared_bytes{0};
+    std::size_t wave{0};
+    if (cudaFuncSetAttribute(&packed_item_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(shared_bytes)) != cudaSuccess ||
+        !one_wave_blocks(&packed_item_kernel, launch.threads, shared_bytes, wave)) {
+        return false;
+    }
+    const std::size_t total{3 * nblocks};
+    const unsigned int blocks{
+        static_cast<unsigned int>(std::min(wave, (total + launch.threads - 1) / launch.threads))};
+    packed_item_kernel<<<blocks, launch.threads, shared_bytes, stream>>>(
+        ac, acs, nz_grid, nz_exact, orders->order, bw, bh, nblocks, context_histograms,
+        reinterpret_cast<unsigned long long*>(item_sizes), token_records,
+        counters + HISTOGRAM_COUNTER, model->context_map, table, phase);
     return cudaGetLastError() == cudaSuccess;
 }
 

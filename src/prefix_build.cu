@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include "ac_clustering.h"
 #include "dc_predict.h"
 #include "src/bitstream/bit_sink.h"
 #include "src/bitstream/frame_assembly.h"
@@ -460,8 +461,41 @@ __global__ void dc_group_blobs_kernel(std::size_t bw, std::size_t bh, std::size_
     }
 }
 
+__global__ void smooth_model(AcClustering* model) {
+    if (blockIdx.x < model->num_clusters)
+        ++model->histograms[blockIdx.x * 64 + threadIdx.x];
+}
+__global__ void make_ac_prefix(const AcClustering* clustering, unsigned* table) {
+    unsigned c = blockIdx.x, lane = threadIdx.x;
+    if (c >= clustering->num_clusters)
+        return;
+    __shared__ TreeScratch tree;
+    __shared__ HistogramCode code;
+    const auto* h = clustering->histograms + 64 * c;
+    for (unsigned j = lane; j < 64; j += 32) {
+        code.hist[j] = h[j];
+        code.depth[j] = 0;
+        code.bits[j] = 0;
+    }
+    __syncwarp();
+    unsigned used =
+        __popc(__ballot_sync(~0u, h[lane] != 0)) + __popc(__ballot_sync(~0u, h[lane + 32] != 0));
+    if (used > 1) {
+        warp_create_huffman_tree(code.hist, 64, 15, code.depth, tree, lane);
+        warp_convert_bit_depths_to_symbols(code.depth, 64, code.bits, lane);
+    }
+    for (unsigned j = lane; j < 64; j += 32)
+        table[c * 256 + j] = code.bits[j] | (unsigned(code.depth[j]) << 16) |
+                             (bitstream::HybridUintConfig{}.raw_bits(j) << 24);
+}
+
 }  // namespace
 
+bool build_scan_prefix(AcClustering* model, unsigned* table, cudaStream_t stream) {
+    smooth_model<<<AC_MAX_CLUSTERS, AC_CONTEXT_ALPHABET, 0, stream>>>(model);
+    make_ac_prefix<<<AC_MAX_CLUSTERS, 32, 0, stream>>>(model, table);
+    return cudaGetLastError() == cudaSuccess;
+}
 bool build_dc_group_blobs_device(std::size_t width, std::size_t height,
                                  const std::uint32_t* d_dc_hist, const std::uint32_t* d_am_hist,
                                  const std::size_t* d_fbc, std::uint8_t* d_dc_depth,

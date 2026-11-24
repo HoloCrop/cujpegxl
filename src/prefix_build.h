@@ -11,6 +11,9 @@
 
 namespace cujpegxl {
 
+struct AcClustering;
+bool build_scan_prefix(AcClustering* model, unsigned* table, cudaStream_t stream);
+
 // Fixed byte stride reserved for each DcGroup header blob in the device blob
 // buffers. Both header blobs (VarDCTDC modular header, AcMetadata modular header)
 // are only a handful of bytes; this bounds them with wide margin so the parallel

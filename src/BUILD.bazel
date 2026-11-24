@@ -402,6 +402,7 @@ cuda_library(
     hdrs = ["prefix_build.h"],
     copts = RUNTIME_COPTS,
     deps = [
+        ":ac_clustering",
         ":dc_predict",
         ":vardct_layout",
         ":warp_scan",

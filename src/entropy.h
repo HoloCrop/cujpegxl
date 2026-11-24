@@ -17,6 +17,17 @@
 
 namespace cujpegxl {
 
+bool prefix_pack(const std::int8_t* acs, const std::uint32_t* token_records, std::size_t width,
+                 std::size_t height, const std::uint64_t* item_sizes,
+                 const std::uint64_t* chunk_base, const std::uint32_t* layout,
+                 std::size_t group_begin, std::size_t group_end, unsigned* packed,
+                 std::uint32_t* counters, cudaStream_t stream);
+bool ac_code_items(const std::int16_t* ac, const std::int8_t* acs, const std::int32_t* nz_grid,
+                   const std::int32_t* nz_exact, const CoeffOrders* orders, std::size_t width,
+                   std::size_t height, std::uint32_t* context_histograms, std::uint64_t* item_sizes,
+                   std::uint32_t* token_records, std::uint32_t* counters, GpuArch arch,
+                   cudaStream_t stream, const AcClustering* model, const unsigned* table,
+                   unsigned phase);
 // The device wrappers below enqueue all their work on `stream` and do not wait
 // for it, so that the DC path runs concurrently with the AC path and frames run
 // concurrently with each other.

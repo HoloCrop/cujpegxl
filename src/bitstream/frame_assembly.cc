@@ -143,6 +143,25 @@ std::vector<std::uint8_t> build_dc_global(const QuantParams& qp) {
     return w.bytes();
 }
 
+BitWriter describe_scan_histograms(const AcClustering& model) {
+    BitWriter w;
+    std::vector<std::uint8_t> depth(model.num_clusters * AC_CONTEXT_ALPHABET);
+    std::vector<std::uint16_t> bits(depth.size());
+    write_clustered_prefix_histograms(w, model.context_map, AC_NUM_CONTEXTS, model.num_clusters,
+                                      model.histograms, AC_CONTEXT_ALPHABET, HybridUintConfig{},
+                                      depth.data(), bits.data());
+    return w;
+}
+std::vector<std::uint8_t> build_scan_ac_global(const CoeffOrders& orders, std::size_t num_groups,
+                                               const BitWriter& histograms) {
+    BitWriter w;
+    detail::serialize_ac_global_head(w, num_groups);
+    write_coeff_orders(w, orders);
+    w.append(histograms);
+    w.zero_pad_to_byte();
+    return w.bytes();
+}
+
 AcGlobalBuilder::AcGlobalBuilder(const AcClustering& clustering, const CoeffOrders& orders,
                                  std::size_t num_ac_groups, TokenCode& code)
     : clustering_{clustering},

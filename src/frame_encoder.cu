@@ -32,30 +32,36 @@
 #include "src/bitstream/frame_assembly.h"
 #include "src/bitstream/token_stream.h"
 #include "vardct_layout.h"
-#include "worker_pool.h"
 
 namespace cujpegxl {
 namespace {
+__global__ void age_histograms(unsigned* hist, unsigned n) {
+    unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+        hist[i] /= 2;
+}
 
+__global__ void finish_groups(const unsigned* layout, unsigned ng, unsigned* sizes,
+                              const unsigned char* body, unsigned char* result) {
+    unsigned g = blockIdx.y;
+    const unsigned* bits = layout + 2 * (ng + 1);
+    unsigned count = (bits[g] + 7) / 8, offset = 0;
+    for (unsigned i = 0; i < g; ++i)
+        offset += (bits[i] + 7) / 8;
+    if (threadIdx.x == 0 && blockIdx.x == 0)
+        sizes[g] = count;
+    body += 8 * layout[ng + 1 + g];
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x)
+        result[offset + i] = body[i];
+}
 using Clock = std::chrono::steady_clock;
 
 constexpr EncodeResult ENCODE_FAILED{EncodeStatus::FAILED, 0};
 
-// The AC groups are packed and copied to the host in this many batches, so that
-// the host codes a batch while the device packs and copies the next ones.
-constexpr std::size_t AC_BATCHES{4};
-
 constexpr std::size_t TEXTURE_PITCH_ALIGNMENT{32};
-
-// About one wake-up latency of a blocked pool thread.
-constexpr std::chrono::microseconds PLACEMENT_SPIN{20};
 
 double us_since(Clock::time_point start) {
     return std::chrono::duration<double, std::micro>(Clock::now() - start).count();
-}
-
-std::size_t batch_begin(std::size_t num_ac, std::size_t b) {
-    return b * num_ac / AC_BATCHES;
 }
 
 std::size_t aligned_plane_pitch(std::size_t width) {
@@ -191,6 +197,8 @@ private:
 struct FrameBuffers {
     std::uint8_t* aligned_luma{nullptr};
     std::uint8_t* aligned_chroma{nullptr};
+    unsigned* lengths;
+    unsigned char* body;
     __half* coeffs{nullptr};
     std::int8_t* acs{nullptr};
     std::int8_t* ytox_map{nullptr};
@@ -207,14 +215,11 @@ struct FrameBuffers {
     CoeffOrders* coeff_orders{nullptr};
     std::uint32_t* context_hist{nullptr};
     std::uint8_t* cluster_scratch{nullptr};
-    AcClustering* clustering{nullptr};
     std::uint64_t* item_sizes{nullptr};
     std::uint32_t* token_records{nullptr};
     std::uint8_t* layout_scratch{nullptr};
     std::uint64_t* chunk_base{nullptr};
     std::uint32_t* layout{nullptr};
-    std::uint16_t* entries{nullptr};
-    std::uint64_t* raw{nullptr};
     std::uint32_t* ac_counters{nullptr};
     std::uint32_t* dc_group_hist{nullptr};
     std::uint8_t* dc_stats_scratch{nullptr};
@@ -245,6 +250,8 @@ FrameBuffers carve_frame_buffers(ArenaCarver& carver, std::size_t width, std::si
     return FrameBuffers{
         .aligned_luma = carver.take<std::uint8_t>(aligned_plane_pitch(width) * height),
         .aligned_chroma = carver.take<std::uint8_t>(aligned_plane_pitch(width) * (height / 2)),
+        .lengths = carver.take<unsigned>(num_ac),
+        .body = carver.take<unsigned char>(4 * ac_max_tokens(width, height)),
         .coeffs = carver.take<__half>(3 * blocks * COEFFS_PER_BLOCK),
         .acs = carver.take<std::int8_t>(blocks),
         .ytox_map = carver.take<std::int8_t>(color_tiles),
@@ -261,14 +268,11 @@ FrameBuffers carve_frame_buffers(ArenaCarver& carver, std::size_t width, std::si
         .coeff_orders = carver.take<CoeffOrders>(1),
         .context_hist = carver.take<std::uint32_t>(AC_NUM_CONTEXTS * AC_CONTEXT_ALPHABET),
         .cluster_scratch = carver.take<std::uint8_t>(ac_cluster_scratch_bytes()),
-        .clustering = carver.take<AcClustering>(1),
         .item_sizes = carver.take<std::uint64_t>(3 * blocks),
         .token_records = carver.take<std::uint32_t>(ac_max_tokens(width, height)),
         .layout_scratch = carver.take<std::uint8_t>(ac_token_layout_scratch_bytes(width, height)),
         .chunk_base = carver.take<std::uint64_t>(ac_token_chunks(width, height)),
         .layout = carver.take<std::uint32_t>(3 * num_ac + 2),
-        .entries = carver.take<std::uint16_t>(ac_max_tokens(width, height)),
-        .raw = carver.take<std::uint64_t>(ac_max_raw_words(width, height)),
         .ac_counters = carver.take<std::uint32_t>(ac_counter_words(width, height)),
         .dc_group_hist = carver.take<std::uint32_t>(2 * num_dc * AC_HISTOGRAM_SIZE),
         .dc_stats_scratch = carver.take<std::uint8_t>(dc_group_stats_scratch_bytes(width, height)),
@@ -292,8 +296,7 @@ FrameBuffers carve_frame_buffers(ArenaCarver& carver, std::size_t width, std::si
 }
 
 // A frame in flight: its parameters and result, and the resources it uses. The
-// device work runs on `stream`, with the DC path on `dc_stream`; the AC token
-// copies run on the encoder's copy stream.
+// device work runs on `stream`, with the DC path on `dc_stream`.
 struct Slot {
     Slot() = default;
     Slot(const Slot&) = delete;
@@ -317,9 +320,7 @@ struct Slot {
     cudaEvent_t forked{nullptr};
     cudaEvent_t layout_copied{nullptr};
     cudaEvent_t dc_sizes_copied{nullptr};
-    cudaEvent_t dc_body_copied{nullptr};
-    std::array<cudaEvent_t, AC_BATCHES> batch_packed{};
-    std::array<cudaEvent_t, AC_BATCHES> batch_copied{};
+    cudaEvent_t ac_complete{nullptr};
     std::array<cudaEvent_t, 2> stream_idle{};
 
     DeviceArena arena;
@@ -327,11 +328,8 @@ struct Slot {
     PinnedBuffer<QuantCalibration> calibration;
     PinnedBuffer<AcClustering> clustering;
     PinnedBuffer<CoeffOrders> coeff_orders;
-    PinnedBuffer<std::uint32_t> layout;
+    PinnedBuffer<unsigned> ac_lengths;
     PinnedBuffer<std::uint32_t> dc_sizes;
-    PinnedBuffer<std::uint8_t> dc_body;
-    PinnedBuffer<std::uint16_t> entries;
-    PinnedBuffer<std::uint64_t> raw;
     std::optional<Nv12Textures> textures;
 
     std::size_t width{0};
@@ -339,8 +337,8 @@ struct Slot {
     std::uint8_t* out_file{nullptr};
     std::size_t out_capacity{0};
     std::vector<StageTiming>* stats{nullptr};
+    uint64_t model_generation{};
     Clock::time_point entropy_start{};
-    bool copies_issued{false};
     EncodeResult result{};
 };
 
@@ -369,10 +367,7 @@ bool Slot::init() {
             cudaStreamCreateWithPriority(&dc_stream, cudaStreamNonBlocking, least_priority) ==
                 cudaSuccess &&
             create_event(input_ready) && create_event(forked) && create_host_event(layout_copied) &&
-            create_host_event(dc_sizes_copied) && create_host_event(dc_body_copied);
-    for (std::size_t b{0}; b < AC_BATCHES; ++b) {
-        ready = ready && create_event(batch_packed[b]) && create_host_event(batch_copied[b]);
-    }
+            create_host_event(dc_sizes_copied) && create_host_event(ac_complete);
     for (cudaEvent_t& e : stream_idle) {
         ready = ready && create_host_event(e);
     }
@@ -387,9 +382,7 @@ bool Slot::wait_idle() {
             return false;
         }
     }
-    // The copy stream also holds the other slots' copies; the slot's own end
-    // with the last batch's.
-    return cudaEventSynchronize(batch_copied.back()) == cudaSuccess;
+    return true;
 }
 
 void Slot::release() {
@@ -399,13 +392,8 @@ void Slot::release() {
             e = nullptr;
         }
     };
-    for (cudaEvent_t* e :
-         {&input_ready, &forked, &layout_copied, &dc_sizes_copied, &dc_body_copied}) {
+    for (cudaEvent_t* e : {&input_ready, &forked, &layout_copied, &dc_sizes_copied, &ac_complete}) {
         destroy_event(*e);
-    }
-    for (std::size_t b{0}; b < AC_BATCHES; ++b) {
-        destroy_event(batch_packed[b]);
-        destroy_event(batch_copied[b]);
     }
     for (cudaEvent_t& e : stream_idle) {
         destroy_event(e);
@@ -418,8 +406,6 @@ void Slot::release() {
     }
     ready = false;
 }
-
-enum class Placement : std::uint8_t { PENDING, PLACE, SKIP };
 
 }  // namespace
 
@@ -444,19 +430,14 @@ std::size_t max_encoded_size(std::size_t width, std::size_t height) {
            TOC_ENTRY_BOUND * num_sections;
 }
 
-// Frame k uses slot k % depth. The caller thread enqueues a frame's device work
-// in submit(); the copy thread enqueues each frame's AC token copies, in order,
-// as soon as its token layout lands, so that they do not wait for the host
-// stage of the frames before it; the driver thread runs each frame's host stage
-// in order, on the worker pool as its thread 0.
+// Frames update a shared device model in submission order. Each slot retains
+// its model snapshot until the driver has serialized its self-contained file.
 struct FrameEncoder::State {
-    State(int device_ordinal, GpuArch arch, std::size_t worker_threads, std::size_t pipeline_depth)
+    State(int device_ordinal, GpuArch arch, std::size_t pipeline_depth)
         : device{device_ordinal},
           arch{arch},
           depth{pipeline_depth},
           slots{std::make_unique<Slot[]>(pipeline_depth)},
-          pool{worker_threads},
-          copier{[this] { copy(); }},
           driver{[this] { drive(); }} {}
     State(const State&) = delete;
     State& operator=(const State&) = delete;
@@ -467,56 +448,34 @@ struct FrameEncoder::State {
         }
         submitted_cv.notify_all();
         driver.join();
-        copier.join();
-        if (copy_stream != nullptr) {
-            cudaStreamDestroy(copy_stream);
-        }
     }
-
-    bool init_copy_stream() {
-        return copy_stream != nullptr ||
-               cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking) == cudaSuccess;
-    }
-
     bool enqueue_frame(Slot& slot, const std::uint8_t* luma, std::size_t luma_pitch,
                        const std::uint8_t* chroma, std::size_t chroma_pitch,
                        cudaStream_t input_stream, float distance);
-    void copy();
-    bool issue_copies(Slot& slot);
-    bool await_copies(const Slot& slot, std::uint64_t frame);
     void drive();
-    EncodeResult code_frame(Slot& slot, std::uint64_t frame);
-    bool release_batches(Slot& slot, bitstream::StreamQueue& queue);
+    EncodeResult code_frame(Slot& slot);
 
     const int device;
     const GpuArch arch;
     const std::size_t depth;
     const std::unique_ptr<Slot[]> slots;
-    cudaStream_t copy_stream{nullptr};
-    WorkerPool pool;
+    DeviceArena entropy_model;
+    uint64_t generation{0};
 
-    bitstream::TokenCode code;
-    std::vector<bitstream::TokenStream> streams;
-    std::vector<std::size_t> order;
-    std::vector<bitstream::CodedStream> coded;
-    std::vector<std::size_t> slot_end;
-    std::vector<std::uint64_t> slot_words;
-    std::vector<std::size_t> ac_offsets;
+    bitstream::BitWriter description;
+    uint64_t described_generation{UINT64_MAX};
     std::vector<std::uint32_t> section_sizes;
 
     // Frame counts since construction; submitted and received change only on
-    // the caller thread, copied only on the copy thread, completed only on the
+    // the caller thread and completed changes only on the
     // driver thread.
     std::mutex mutex;
     std::condition_variable submitted_cv;
-    std::condition_variable copied_cv;
     std::condition_variable completed_cv;
     std::uint64_t submitted{0};
-    std::uint64_t copied{0};
     std::uint64_t completed{0};
     std::uint64_t received{0};
     bool stop{false};
-    std::thread copier;
     std::thread driver;
 };
 
@@ -529,13 +488,12 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
     const std::size_t height{padded_to_blocks(slot.height)};
     const std::size_t num_ac{bitstream::ac_group_count(width, height)};
     const std::size_t num_dc{bitstream::dc_group_count(width, height)};
-    const std::size_t layout_words{3 * num_ac + 2};
 
     ArenaCarver measure{0};
     carve_frame_buffers(measure, width, height);
-    if (!slot.arena.reserve(measure.size()) || !slot.calibration.reserve(1) ||
-        !slot.clustering.reserve(1) || !slot.coeff_orders.reserve(1) ||
-        !slot.layout.reserve(layout_words) || !slot.dc_sizes.reserve(num_dc)) {
+    if (!slot.arena.reserve(measure.size()) || !slot.ac_lengths.reserve(num_ac) ||
+        !slot.calibration.reserve(1) || !slot.clustering.reserve(1) ||
+        !slot.coeff_orders.reserve(1) || !slot.dc_sizes.reserve(num_dc)) {
         return false;
     }
     ArenaCarver carver{reinterpret_cast<std::uintptr_t>(slot.arena.data())};
@@ -551,7 +509,7 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
     // needs the oldest frame first, and frames sharing the GPU would all
     // finish late together.
     if (submitted != 0 &&
-        cudaStreamWaitEvent(slot.stream, slots[(submitted - 1) % depth].batch_packed.back(), 0) !=
+        cudaStreamWaitEvent(slot.stream, slots[(submitted - 1) % depth].ac_complete, 0) !=
             cudaSuccess) {
         return false;
     }
@@ -606,37 +564,66 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
         return false;
     }
 
-    if (!ac_coeff_orders(d.order_stats, d.coeff_orders, slot.stream) ||
-        !ac_build_histogram(d.ac, d.acs, d.nz_grid, d.nz_exact, d.coeff_orders, width, height,
-                            d.context_hist, d.item_sizes, d.token_records, d.ac_counters, arch,
-                            slot.stream) ||
+    constexpr size_t bins = AC_NUM_CONTEXTS * AC_CONTEXT_ALPHABET;
+    if (!entropy_model.reserve(sizeof(AcClustering) +
+                               (AC_MAX_CLUSTERS * bitstream::HISTOGRAM_STRIDE + bins) *
+                                   sizeof(unsigned)))
+        return false;
+    auto model = reinterpret_cast<AcClustering*>(entropy_model.data());
+    auto table = reinterpret_cast<unsigned*>(model + 1);
+    auto history = table + AC_MAX_CLUSTERS * bitstream::HISTOGRAM_STRIDE;
+    if (!ac_coeff_orders(d.order_stats, d.coeff_orders, slot.stream))
+        return false;
+    if (submitted == 0) {
+        if (cudaMemsetAsync(history, 0, bins * sizeof(unsigned), slot.stream) != cudaSuccess)
+            return false;
+        if (!ac_build_histogram(d.ac, d.acs, d.nz_grid, d.nz_exact, d.coeff_orders, width, height,
+                                d.context_hist, d.item_sizes, d.token_records, d.ac_counters, arch,
+                                slot.stream) ||
+            !ac_cluster_contexts(d.context_hist, d.cluster_scratch, model, slot.stream))
+            return false;
+        if (!build_scan_prefix(model, table, slot.stream))
+            return false;
+        generation = submitted;
+    }
+    // Adapt quickly at startup, then halve the history at each 16-image refresh.
+    if (submitted == 2 || submitted == 4 || submitted == 8 || (submitted && submitted % 16 == 0)) {
+        if (!ac_cluster_contexts(history, d.cluster_scratch, model, slot.stream))
+            return false;
+        if (!build_scan_prefix(model, table, slot.stream))
+            return false;
+        generation = submitted;
+        age_histograms<<<(bins + 255) / 256, 256, 0, slot.stream>>>(history, bins);
+    }
+    slot.model_generation = generation;
+    if (!ac_code_items(d.ac, d.acs, d.nz_grid, d.nz_exact, d.coeff_orders, width, height, history,
+                       d.item_sizes, d.token_records, d.ac_counters, arch, slot.stream, model,
+                       table, submitted % 16) ||
         !ac_token_layout(d.item_sizes, width, height, d.layout_scratch, d.ac_counters, d.chunk_base,
-                         d.layout, d.raw, slot.stream) ||
-        !ac_cluster_contexts(d.context_hist, d.cluster_scratch, d.clustering, slot.stream) ||
+                         d.layout, reinterpret_cast<uint64_t*>(d.body), slot.stream) ||
         cudaMemcpyAsync(slot.calibration.data(), d.calibration, sizeof(QuantCalibration),
                         cudaMemcpyDeviceToHost, slot.stream) != cudaSuccess ||
-        cudaMemcpyAsync(slot.clustering.data(), d.clustering, sizeof(AcClustering),
-                        cudaMemcpyDeviceToHost, slot.stream) != cudaSuccess ||
+        cudaMemcpyAsync(slot.clustering.data(), model, sizeof(AcClustering), cudaMemcpyDeviceToHost,
+                        slot.stream) != cudaSuccess ||
         // The host reads only the Lehmer codes of the orders.
         cudaMemcpyAsync(slot.coeff_orders.data()->lehmer, d.coeff_orders->lehmer,
                         sizeof(CoeffOrders::lehmer), cudaMemcpyDeviceToHost,
                         slot.stream) != cudaSuccess ||
-        cudaMemcpyAsync(slot.layout.data(), d.layout, layout_words * sizeof(std::uint32_t),
-                        cudaMemcpyDeviceToHost, slot.stream) != cudaSuccess ||
         cudaEventRecord(slot.layout_copied, slot.stream) != cudaSuccess) {
         return false;
     }
-    for (std::size_t b{0}; b < AC_BATCHES; ++b) {
-        const std::size_t g0{batch_begin(num_ac, b)};
-        const std::size_t g1{batch_begin(num_ac, b + 1)};
-        if ((g0 != g1 &&
-             !ac_pack_tokens(d.acs, d.token_records, width, height, d.clustering->context_map,
-                             d.item_sizes, d.chunk_base, d.layout, g0, g1, d.entries, d.raw,
-                             d.ac_counters, slot.stream)) ||
-            cudaEventRecord(slot.batch_packed[b], slot.stream) != cudaSuccess) {
-            return false;
-        }
-    }
+
+    auto st = slot.stream;
+    auto packed = reinterpret_cast<unsigned*>(d.body);
+    if (!prefix_pack(d.acs, d.token_records, width, height, d.item_sizes, d.chunk_base, d.layout, 0,
+                     num_ac, packed, d.ac_counters, st))
+        return false;
+    finish_groups<<<dim3(8, num_ac), 128, 0, st>>>(
+        d.layout, num_ac, d.lengths, d.body, reinterpret_cast<unsigned char*>(d.token_records));
+    if (cudaMemcpyAsync(slot.ac_lengths.data(), d.lengths, 4 * num_ac, cudaMemcpyDeviceToHost,
+                        st) != cudaSuccess ||
+        cudaEventRecord(slot.ac_complete, st) != cudaSuccess)
+        return false;
     return true;
 }
 
@@ -652,7 +639,7 @@ void FrameEncoder::State::drive() {
         const std::uint64_t frame{completed};
         lock.unlock();
         Slot& slot{slots[frame % depth]};
-        const EncodeResult result{code_frame(slot, frame)};
+        const EncodeResult result{code_frame(slot)};
         lock.lock();
         slot.result = result;
         ++completed;
@@ -660,105 +647,7 @@ void FrameEncoder::State::drive() {
     }
 }
 
-void FrameEncoder::State::copy() {
-    // A failure shows in the frames' `copies_issued`.
-    cudaSetDevice(device);
-    std::unique_lock<std::mutex> lock{mutex};
-    for (;;) {
-        submitted_cv.wait(lock, [this] { return stop || copied != submitted; });
-        if (copied == submitted) {
-            return;
-        }
-        Slot& slot{slots[copied % depth]};
-        lock.unlock();
-        const bool issued{issue_copies(slot)};
-        lock.lock();
-        slot.copies_issued = issued;
-        ++copied;
-        copied_cv.notify_one();
-    }
-}
-
-// Enqueues the copies of the slot's AC token batches once its token layout has
-// landed. False on a CUDA error.
-bool FrameEncoder::State::issue_copies(Slot& slot) {
-    if (cudaEventSynchronize(slot.layout_copied) != cudaSuccess) {
-        return false;
-    }
-    const std::size_t num_ac{bitstream::ac_group_count(slot.width, slot.height)};
-    const std::uint32_t* const token_offset{slot.layout.data()};
-    const std::uint32_t* const raw_offset{token_offset + num_ac + 1};
-    // One raw word past the last group's: the coder may read it.
-    if (!slot.entries.reserve(token_offset[num_ac]) || !slot.raw.reserve(raw_offset[num_ac] + 1)) {
-        return false;
-    }
-    for (std::size_t b{0}; b < AC_BATCHES; ++b) {
-        const std::size_t g0{batch_begin(num_ac, b)};
-        const std::size_t g1{batch_begin(num_ac, b + 1)};
-        const std::size_t num_tokens{token_offset[g1] - token_offset[g0]};
-        const std::size_t num_raw{raw_offset[g1] - raw_offset[g0]};
-        if (cudaStreamWaitEvent(copy_stream, slot.batch_packed[b], 0) != cudaSuccess ||
-            (num_tokens != 0 &&
-             cudaMemcpyAsync(slot.entries.data() + token_offset[g0],
-                             slot.device.entries + token_offset[g0],
-                             num_tokens * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
-                             copy_stream) != cudaSuccess) ||
-            (num_raw != 0 &&
-             cudaMemcpyAsync(slot.raw.data() + raw_offset[g0], slot.device.raw + raw_offset[g0],
-                             num_raw * sizeof(std::uint64_t), cudaMemcpyDeviceToHost,
-                             copy_stream) != cudaSuccess) ||
-            cudaEventRecord(slot.batch_copied[b], copy_stream) != cudaSuccess) {
-            // Ends the copies enqueued so far for Slot::wait_idle.
-            cudaEventRecord(slot.batch_copied.back(), copy_stream);
-            return false;
-        }
-    }
-    return true;
-}
-
-// Waits until the copy thread has handled `frame`, in `slot`; whether its copies
-// were enqueued.
-bool FrameEncoder::State::await_copies(const Slot& slot, std::uint64_t frame) {
-    std::unique_lock<std::mutex> lock{mutex};
-    copied_cv.wait(lock, [this, frame] { return copied > frame; });
-    return slot.copies_issued;
-}
-
-// Releases the AC groups to `queue` batch by batch as their copies land, each
-// time all the batches landed so far, longest groups first. False on a CUDA
-// error.
-bool FrameEncoder::State::release_batches(Slot& slot, bitstream::StreamQueue& queue) {
-    const std::size_t num_ac{queue.num_streams};
-    std::size_t landed{0};
-    while (landed < AC_BATCHES) {
-        if (cudaEventSynchronize(slot.batch_copied[landed]) != cudaSuccess) {
-            return false;
-        }
-        ++landed;
-        for (cudaError_t status{}; landed < AC_BATCHES; ++landed) {
-            status = cudaEventQuery(slot.batch_copied[landed]);
-            if (status == cudaErrorNotReady) {
-                break;
-            }
-            if (status != cudaSuccess) {
-                return false;
-            }
-        }
-        const std::size_t begin{queue.ready.load(std::memory_order_relaxed)};
-        const std::size_t end{batch_begin(num_ac, landed)};
-        std::iota(order.begin() + static_cast<std::ptrdiff_t>(begin),
-                  order.begin() + static_cast<std::ptrdiff_t>(end), begin);
-        std::stable_sort(order.begin() + static_cast<std::ptrdiff_t>(begin),
-                         order.begin() + static_cast<std::ptrdiff_t>(end),
-                         [&](std::size_t a, std::size_t b) {
-                             return streams[a].num_tokens > streams[b].num_tokens;
-                         });
-        queue.ready.store(end, std::memory_order_release);
-    }
-    return true;
-}
-
-EncodeResult FrameEncoder::State::code_frame(Slot& slot, std::uint64_t frame) {
+EncodeResult FrameEncoder::State::code_frame(Slot& slot) {
     const std::size_t width{slot.width};
     const std::size_t height{slot.height};
     const std::size_t num_ac{bitstream::ac_group_count(width, height)};
@@ -768,8 +657,6 @@ EncodeResult FrameEncoder::State::code_frame(Slot& slot, std::uint64_t frame) {
     StageTiming assembly{"assembly", 0, 0.0, 0.0};
 
     if (cudaEventSynchronize(slot.layout_copied) != cudaSuccess) {
-        // The slot may be reused only once the copy thread is done with it.
-        await_copies(slot, frame);
         return ENCODE_FAILED;
     }
     entropy.gpu_us =
@@ -779,185 +666,56 @@ EncodeResult FrameEncoder::State::code_frame(Slot& slot, std::uint64_t frame) {
     const std::vector<std::uint8_t> dc_global{bitstream::build_dc_global(
         bitstream::QuantParams{calibration.global_scale, calibration.quant_dc})};
 
-    const std::uint32_t* const token_offset{slot.layout.data()};
-    const std::uint32_t* const raw_offset{token_offset + num_ac + 1};
-    const std::uint32_t* const raw_bits{raw_offset + num_ac + 1};
-    bitstream::AcGlobalBuilder tables{*slot.clustering.data(), *slot.coeff_orders.data(), num_ac,
-                                      code};
-    streams.resize(num_ac);
-    order.resize(num_ac);
-    coded.assign(num_ac, bitstream::CodedStream{});
-    slot_end.resize(num_ac);
-    ac_offsets.resize(num_ac);
-    std::size_t slot_total{0};
-    for (std::size_t g{0}; g < num_ac; ++g) {
-        // The data pointers are set once the copy thread has reserved the buffers.
-        streams[g] = bitstream::TokenStream{.num_tokens = token_offset[g + 1] - token_offset[g],
-                                            .raw_bits = raw_bits[g]};
-        slot_total += bitstream::coded_stream_capacity_words(streams[g]);
-        slot_end[g] = slot_total;
+    if (described_generation != slot.model_generation) {
+        description = bitstream::describe_scan_histograms(*slot.clustering.data());
+        described_generation = slot.model_generation;
     }
-    if (slot_words.size() < slot_total) {
-        slot_words.resize(slot_total);
-    }
-    bitstream::StreamQueue queue{};
-    queue.streams = streams.data();
-    queue.num_streams = num_ac;
-    queue.order = order.data();
-    queue.slot_words = slot_words.data();
-    queue.slot_end = slot_end.data();
-    queue.coded = coded.data();
-
-    std::atomic<std::size_t> next_table{0};
-    std::atomic<std::size_t> tables_done{0};
-    std::atomic<bool> code_ready{false};
-    std::vector<std::uint8_t> ac_global{};
-    std::atomic<std::size_t> coders_done{0};
-    std::atomic<Placement> placement{Placement::PENDING};
-    std::mutex placement_mutex;
-    std::condition_variable placement_cv;
-    const auto set_placement = [&](Placement p) {
-        placement.store(p, std::memory_order_release);
-        // A waiter checks `placement` under the mutex before it blocks.
-        {
-            const std::lock_guard<std::mutex> lock{placement_mutex};
-        }
-        placement_cv.notify_all();
-    };
-    std::atomic<std::size_t> next_placed{0};
-    EncodeResult result{ENCODE_FAILED};
-    const std::size_t num_threads{pool.size()};
-
-    // All threads build the context map, the longest job, first, the
-    // coefficient orders and the clusters' ANS tables, then thread 0 completes the AcGlobal and
-    // releases the batches as their copies land, longest groups first, and fetches the DcGroups
-    // while the others code; once all are done it lays out the file, and every thread places a
-    // share of the AC groups.
-    pool.run([&](std::size_t t) {
-        for (std::size_t c{next_table.fetch_add(1, std::memory_order_relaxed)};
-             c < tables.num_clusters() + 2;
-             c = next_table.fetch_add(1, std::memory_order_relaxed)) {
-            if (c == 0) {
-                tables.build_context_map();
-            } else if (c == 1) {
-                tables.build_coeff_orders();
-            } else {
-                tables.build_cluster(c - 2);
-            }
-        }
-        tables_done.fetch_add(1, std::memory_order_acq_rel);
-        if (t == 0) {
-            while (tables_done.load(std::memory_order_acquire) != num_threads) {
-                std::this_thread::yield();
-            }
-            ac_global = tables.finish();
-            code_ready.store(true, std::memory_order_release);
-            bool copies_ok{await_copies(slot, frame)};
-            if (copies_ok) {
-                for (std::size_t g{0}; g < num_ac; ++g) {
-                    streams[g].entries = slot.entries.data() + token_offset[g];
-                    streams[g].raw = slot.raw.data() + raw_offset[g];
-                }
-                copies_ok = release_batches(slot, queue);
-            }
-            if (!copies_ok) {
-                queue.cancelled.store(true, std::memory_order_release);
-            }
-        } else {
-            while (!code_ready.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-        }
-        bitstream::code_token_streams(code, queue);
-        coders_done.fetch_add(1, std::memory_order_acq_rel);
-        if (t != 0) {
-            // Thread 0 lays out the file after its waits for the DC sections,
-            // which can take far longer than a wake-up.
-            const Clock::time_point spin_end{Clock::now() + PLACEMENT_SPIN};
-            while (placement.load(std::memory_order_acquire) == Placement::PENDING &&
-                   Clock::now() < spin_end) {
-                std::this_thread::yield();
-            }
-            std::unique_lock<std::mutex> lock{placement_mutex};
-            placement_cv.wait(lock, [&] {
-                return placement.load(std::memory_order_acquire) != Placement::PENDING;
-            });
-        } else {
-            bool dc_ok{!queue.cancelled.load(std::memory_order_acquire) &&
-                       cudaEventSynchronize(slot.dc_sizes_copied) == cudaSuccess};
-            std::size_t dc_total{0};
-            if (dc_ok) {
-                // The DC encoder skips sections over its capacity without failing.
-                dc_total = std::accumulate(slot.dc_sizes.data(), slot.dc_sizes.data() + num_dc,
-                                           std::size_t{0});
-                dc_ok = dc_total <= caps.dc_groups && slot.dc_body.reserve(dc_total) &&
-                        cudaMemcpyAsync(slot.dc_body.data(), slot.device.dc_body, dc_total,
-                                        cudaMemcpyDeviceToHost, slot.dc_stream) == cudaSuccess &&
-                        cudaEventRecord(slot.dc_body_copied, slot.dc_stream) == cudaSuccess;
-            }
-            while (coders_done.load(std::memory_order_acquire) != num_threads) {
-                std::this_thread::yield();
-            }
-            entropy.cpu_us = us_since(entropy_cpu_start);
-            const Clock::time_point assembly_start{Clock::now()};
-            if (!dc_ok || cudaEventSynchronize(slot.dc_body_copied) != cudaSuccess) {
-                set_placement(Placement::SKIP);
-                return;
-            }
-            section_sizes.clear();
-            section_sizes.push_back(static_cast<std::uint32_t>(dc_global.size()));
-            section_sizes.insert(section_sizes.end(), slot.dc_sizes.data(),
-                                 slot.dc_sizes.data() + num_dc);
-            section_sizes.push_back(static_cast<std::uint32_t>(ac_global.size()));
-            std::size_t ac_total{0};
-            for (const bitstream::CodedStream& c : coded) {
-                section_sizes.push_back(static_cast<std::uint32_t>(c.size_bytes()));
-                ac_total += c.size_bytes();
-            }
-            const std::vector<std::uint8_t> head{bitstream::build_codestream_head(
-                static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height),
-                section_sizes)};
-            const std::size_t codestream_size{head.size() + dc_global.size() + dc_total +
-                                              ac_global.size() + ac_total};
-            const std::vector<std::uint8_t> framing{bitstream::container_framing(codestream_size)};
-            const std::size_t file_size{framing.size() + codestream_size};
-            if (file_size > slot.out_capacity) {
-                result = EncodeResult{EncodeStatus::BUFFER_TOO_SMALL, file_size};
-                set_placement(Placement::SKIP);
-                return;
-            }
-            std::uint8_t* at{std::copy(framing.begin(), framing.end(), slot.out_file)};
-            at = std::copy(head.begin(), head.end(), at);
-            at = std::copy(dc_global.begin(), dc_global.end(), at);
-            std::memcpy(at, slot.dc_body.data(), dc_total);
-            at = std::copy(ac_global.begin(), ac_global.end(), at + dc_total);
-            std::size_t offset{static_cast<std::size_t>(at - slot.out_file)};
-            for (std::size_t g{0}; g < num_ac; ++g) {
-                ac_offsets[g] = offset;
-                offset += coded[g].size_bytes();
-            }
-            result = EncodeResult{EncodeStatus::OK, file_size};
-            assembly.cpu_us = us_since(assembly_start);
-            set_placement(Placement::PLACE);
-        }
-        if (placement.load(std::memory_order_acquire) == Placement::PLACE) {
-            for (std::size_t g{next_placed.fetch_add(1, std::memory_order_relaxed)}; g < num_ac;
-                 g = next_placed.fetch_add(1, std::memory_order_relaxed)) {
-                bitstream::place_coded_stream(coded[g], slot.out_file + ac_offsets[g]);
-            }
-        }
-    });
-
+    auto ac_global =
+        bitstream::build_scan_ac_global(*slot.coeff_orders.data(), num_ac, description);
+    auto s = slot.stream;
+    auto body = slot.device.token_records;
+    auto& lengths = slot.ac_lengths;
+    if (cudaEventSynchronize(slot.ac_complete) != cudaSuccess ||
+        cudaEventSynchronize(slot.dc_sizes_copied) != cudaSuccess)
+        return ENCODE_FAILED;
+    entropy.cpu_us = us_since(entropy_cpu_start);
+    auto assembly_start = Clock::now();
+    const size_t ac_total = std::accumulate(lengths.data(), lengths.data() + num_ac, size_t{0});
+    const size_t dc_total =
+        std::accumulate(slot.dc_sizes.data(), slot.dc_sizes.data() + num_dc, size_t{0});
+    if (dc_total > caps.dc_groups)
+        return ENCODE_FAILED;
+    section_sizes.clear();
+    section_sizes.push_back(dc_global.size());
+    section_sizes.insert(section_sizes.end(), slot.dc_sizes.data(), slot.dc_sizes.data() + num_dc);
+    section_sizes.push_back(ac_global.size());
+    section_sizes.insert(section_sizes.end(), lengths.data(), lengths.data() + num_ac);
+    auto head = bitstream::build_codestream_head(width, height, section_sizes);
+    size_t total = head.size() + dc_global.size() + dc_total + ac_global.size() + ac_total;
+    auto framing = bitstream::container_framing(total);
+    total += framing.size();
+    if (total > slot.out_capacity)
+        return {EncodeStatus::BUFFER_TOO_SMALL, total};
+    auto p = std::copy(framing.begin(), framing.end(), slot.out_file);
+    p = std::copy(head.begin(), head.end(), p);
+    p = std::copy(dc_global.begin(), dc_global.end(), p);
+    if (cudaMemcpyAsync(p, slot.device.dc_body, dc_total, cudaMemcpyDeviceToHost, s) != cudaSuccess)
+        return ENCODE_FAILED;
+    p = std::copy(ac_global.begin(), ac_global.end(), p + dc_total);
+    if (cudaMemcpyAsync(p, body, ac_total, cudaMemcpyDeviceToHost, s) != cudaSuccess ||
+        cudaStreamSynchronize(s) != cudaSuccess)
+        return ENCODE_FAILED;
     if (slot.stats != nullptr) {
+        assembly.cpu_us = us_since(assembly_start);
         slot.stats->push_back(entropy);
         slot.stats->push_back(assembly);
     }
-    return result;
+    return {EncodeStatus::OK, total};
 }
 
-FrameEncoder::FrameEncoder(std::int32_t device_ordinal, GpuArch arch, std::size_t worker_threads,
-                           std::size_t pipeline_depth)
-    : state_{std::make_unique<State>(device_ordinal, arch, worker_threads, pipeline_depth)} {
+FrameEncoder::FrameEncoder(std::int32_t device_ordinal, GpuArch arch,
+                           std::size_t /*worker_threads*/, std::size_t pipeline_depth)
+    : state_{std::make_unique<State>(device_ordinal, arch, pipeline_depth)} {
     assert(pipeline_depth >= 1);
 }
 
@@ -985,8 +743,7 @@ bool FrameEncoder::submit(const std::uint8_t* luma, std::size_t luma_pitch,
     Slot& slot{s.slots[s.submitted % s.depth]};
     // The slot's previous frame has completed, but after a failure its device
     // work may still be running.
-    if (cudaSetDevice(s.device) != cudaSuccess || !s.init_copy_stream() || !slot.init() ||
-        !slot.wait_idle()) {
+    if (cudaSetDevice(s.device) != cudaSuccess || !slot.init() || !slot.wait_idle()) {
         return false;
     }
     slot.width = width;

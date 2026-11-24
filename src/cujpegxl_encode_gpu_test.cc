@@ -481,10 +481,10 @@ TEST(CujpegxlEncodeGpu, PipelinesFramesInOrder) {
     cujpegxl_encoder_destroy(encoder);
 
     EXPECT_LT(outputs[1].size, outputs[0].size);
-    EXPECT_EQ(outputs[2].size, outputs[1].size);
-    EXPECT_TRUE(std::equal(buffers[1].begin(),
-                           buffers[1].begin() + static_cast<std::ptrdiff_t>(outputs[1].size),
-                           buffers[2].begin()));
+    DecodedImage before_refresh{}, after_refresh{};
+    ASSERT_TRUE(decode(outputs[1].data, outputs[1].size, before_refresh));
+    ASSERT_TRUE(decode(outputs[2].data, outputs[2].size, after_refresh));
+    EXPECT_EQ(before_refresh.rgb, after_refresh.rgb);
     for (const cujpegxl_output& output : outputs) {
         DecodedImage decoded{};
         ASSERT_TRUE(decode(output.data, output.size, decoded));

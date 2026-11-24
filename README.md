@@ -6,6 +6,10 @@
 
 This project is a CUDA port of a JPEG XL encoder, implementing a GPU- and real-time-friendly subset of the JPEG XL algorithm.
 
+## HoloCrop scan encoding
+
+Keep one encoder instance alive across a scan. It builds an initial AC prefix codebook from the first image and samples one in sixteen groups of image blocks on every image. The sampling position rotates. The encoder refreshes the codebook after 2, 4 and 8 images, then every 16 images, giving recent samples more weight. Each JPEG XL file embeds the codebook it uses and decodes independently. Starting a new encoder resets the history.
+
 ## Goals
 
 * Conformance. The encoded image must be readable by any standard-conforming decoder.
@@ -16,7 +20,7 @@ This project is a CUDA port of a JPEG XL encoder, implementing a GPU- and real-t
 The project is still in an early development stage, and further iterations are required to improve compression quality, runtime performance, feature support, and general robustness.
 
 - Current quality/size ratio is close to the reference JPEG XL at mid compression rate, but it falls off a bit at high or low compression settings. Substantially better than JPEG, with 40-60% better compression rate at equal quality, and 5-50% better quality (SSIMULACRA2) at equal compression rate (especially better at higher compression rates), but inferior to the libjxl JPEG XL implementation (on average 15% worse compression rate at comparable quality).
-- Performance is currently limited (it achieves sustained 320 fps at 4K resolution on a GTX 1080Ti + Ryzen 7 2700X). The future ambition would be to sustain 15 fps at 4K resolution using a limited slice (ideally <10%) of an embedded/constrained device (e.g. a Jetson Orin Nano). Tegra- and RTX-specific optimizations (FP16 calculations, tensor core usage, etc.) are not implemented yet.
+- Performance is currently limited (it achieves sustained 320 fps at 4K resolution on a GTX 1080Ti + Ryzen 7 2700X). The future ambition would be to sustain 15 fps at 4K resolution using a limited slice (ideally <10%) of an embedded/constrained device (e.g. a Jetson Orin Nano). The HoloCrop branch uses tensor-core DCTs and half-precision frontend operations on Orin and Ada.
 
 ## Usage
 
@@ -42,7 +46,7 @@ bazelisk build --config=jetson_jp72 //packaging:install_tree
 Quality and compression rate are lower compared to the reference libjxl implementation. This is expected, as cujpegxl only implements a subset of the JPEG XL algorithm, excluding some parts of it (in particular, some GPU-unfriendly steps are intentionally omitted for performance reasons).
 
 Notable exclusions include:
-- rANS+Huffman coding used only for AC coefficients; DC and AcMetadata use Huffman coding only.
+- Scan encoding uses Huffman coding for the AC, DC and AcMetadata sections.
 - LZ77 pre-pass is omitted.
 - No non-square, <8 and >32 transforms.
 - No iterative Butteraugli rate control.

@@ -220,6 +220,12 @@ protected:
             expected_[i] = encode(serial, *images_[i], f.width, f.height, f.distance);
             ASSERT_FALSE(expected_[i].empty());
         }
+        // Refreshes use preceding frames, so compare both rounds with the
+        // corresponding generation from a depth-one encoder.
+        for (std::size_t i{0}; i < NUM_FRAMES; ++i) {
+            const auto& f = FRAMES[i];
+            expected_[NUM_FRAMES + i] = encode(serial, *images_[i], f.width, f.height, f.distance);
+        }
     }
 
     // Encodes the frames `rounds` times over, keeping `depth` in flight, and
@@ -230,7 +236,7 @@ protected:
         std::size_t received{0};
         const auto receive_one = [&] {
             const std::vector<std::uint8_t>& file{files[received % depth]};
-            const std::vector<std::uint8_t>& expected{expected_[received % NUM_FRAMES]};
+            const std::vector<std::uint8_t>& expected{expected_[received]};
             const EncodeResult result{encoder.receive()};
             ASSERT_EQ(result.status, EncodeStatus::OK);
             ASSERT_EQ(result.file_size, expected.size());
@@ -252,7 +258,7 @@ protected:
     }
 
     std::unique_ptr<DeviceNv12> images_[NUM_FRAMES];
-    std::vector<std::uint8_t> expected_[NUM_FRAMES];
+    std::vector<std::uint8_t> expected_[2 * NUM_FRAMES];
 };
 
 TEST_F(Pipeline, MatchesSerialEncodes) {

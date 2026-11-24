@@ -69,6 +69,10 @@ private:
     BitWriter context_map_bits_;
 };
 
+BitWriter describe_scan_histograms(const AcClustering& model);
+std::vector<std::uint8_t> build_scan_ac_global(const CoeffOrders& orders, std::size_t num_groups,
+                                               const BitWriter& histograms);
+
 // The codestream head: signature + SizeHeader + ImageMetadata + FrameHeader +
 // multi-entry TOC for `section_sizes` (in codestream order: DcGlobal, DcGroups,
 // AcGlobal, AcGroups). Byte-aligned; the body sections follow directly.

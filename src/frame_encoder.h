@@ -49,18 +49,12 @@ SectionCapacities section_capacities(std::size_t width, std::size_t height);
 // buffer of this capacity, an encode never reports BUFFER_TOO_SMALL.
 std::size_t max_encoded_size(std::size_t width, std::size_t height);
 
-// The device encoder of the C ABI, a pipeline of frames: submit() enqueues a
-// frame's device work and returns, a host thread then entropy-codes and
-// assembles it, and receive() returns the results in submission order. Up to
-// `pipeline_depth` frames are in flight (submitted and not yet received), each
-// in its own slot of device scratch, pinned staging buffers, streams and
-// events, so that the device work of a frame runs while the host codes the
-// frames before it. submit() and receive() must not be called concurrently.
+// submit() queues device work and receive() returns the files in submission
+// order. A host thread assembles the headers while the device processes AC
+// groups. The caller serializes submit() and receive().
 class FrameEncoder {
 public:
-    // Frames are encoded on `device_ordinal`, whose running code image is tuned
-    // for `arch` (see query_device_support). `worker_threads` (at least 1) host
-    // threads code one frame at a time; `pipeline_depth` is at least 1.
+    // worker_threads is retained for source compatibility.
     FrameEncoder(std::int32_t device_ordinal, GpuArch arch, std::size_t worker_threads,
                  std::size_t pipeline_depth);
     FrameEncoder(const FrameEncoder&) = delete;
@@ -85,13 +79,9 @@ public:
     // (width+1)/2 pairs per row over (height+1)/2 rows. Single-AC-group frames
     // use the combined-section layout and are not handled here.
     //
-    // The device runs the transform selection, chroma-from-luma estimate,
-    // residual+quantize, codes the DcGroups and tokenizes the AC groups; the
-    // host builds the AC entropy code (AcGlobal) from the device histograms,
-    // codes each AC group's tokens on the worker threads as they arrive, and
-    // assembles the headers, TOC and sections in `out_file`. The output does
-    // not depend on the number of worker threads, the pipeline depth or the
-    // other frames in flight.
+    // Each file embeds its own AC codebook. The encoder learns the codebook
+    // from the scan and periodically updates it using samples from later images.
+    // An identical input sequence produces identical bytes at any pipeline depth.
     //
     // When `stats` is non-null it receives the "frontend", "entropy" and
     // "assembly" stage timings; the front end is then waited for in submit().
