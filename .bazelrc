@@ -11,7 +11,7 @@ build --copt=-O3
 build --host_copt=-O3
 
 build --@rules_cuda//cuda:compiler=clang
-build --@rules_cuda//cuda:archs=sm_61;sm_87
+build --@rules_cuda//cuda:archs=sm_61;sm_87;sm_89
 # 32-bit shared, constant and local pointers; clang defaults to 64-bit, which
 # spends a register pair on every shared-memory address.
 build --@rules_cuda//cuda:copts=-fcuda-short-ptr

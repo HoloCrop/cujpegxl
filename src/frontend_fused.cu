@@ -290,12 +290,15 @@ __device__ inline void store_half4(__half* dst, const float* v) {
         Half4{{__floats2half2_rn(v[0], v[1]), __floats2half2_rn(v[2], v[3])}};
 }
 
-// On sm_87, the 32x32 Y candidate and the X and B transforms run on the tensor
-// cores (dct_mma_impl.cuh).
-constexpr bool DCT_MMA{COMPILED_ARCH == GpuArch::SM87};
-// On sm_87, parts of the adaptive quantization and the X/B gaborish run in
-// half2 arithmetic, whose throughput on sm_61 is 1/64 of FP32.
-constexpr bool HALF2_FRONTEND{COMPILED_ARCH == GpuArch::SM87};
+// Orin and Ada use tensor cores for the 32x32 Y candidate and the X/B
+// transforms, and half2 arithmetic for adaptive quantization and X/B gaborish.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 890)
+constexpr bool DCT_MMA{true};
+constexpr bool HALF2_FRONTEND{true};
+#else
+constexpr bool DCT_MMA{false};
+constexpr bool HALF2_FRONTEND{false};
+#endif
 
 // Not const: a const table is placed in the constant bank, whose loads
 // serialize over the lanes' distinct addresses.
