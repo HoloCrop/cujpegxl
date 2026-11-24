@@ -512,29 +512,36 @@ bool FrameEncoder::State::enqueue_frame(Slot& slot, const std::uint8_t* luma,
         return false;
     }
 
-    const std::optional<Plane> luma_src{texture_plane({luma, luma_pitch}, slot.width, slot.height,
-                                                      width, d.aligned_luma, slot.stream)};
-    const std::optional<Plane> chroma_src{
-        texture_plane({chroma, chroma_pitch}, (slot.width + 1) / 2 * 2, (slot.height + 1) / 2,
-                      width, d.aligned_chroma, slot.stream)};
-    if (!luma_src || !chroma_src) {
-        return false;
-    }
-    slot.textures.emplace(luma_src->data, luma_src->pitch, chroma_src->data, chroma_src->pitch,
-                          slot.width, slot.height, slot.stream);
-
     if (!order_model.reserve(sizeof(CoeffOrderStats) + sizeof(CoeffOrders)))
         return false;
     auto* order_history = reinterpret_cast<CoeffOrderStats*>(order_model.data());
     auto* orders = reinterpret_cast<CoeffOrders*>(order_history + 1);
-    const Clock::time_point frontend_start{Clock::now()};
-    if (!encode_frontend(*slot.textures, slot.width, slot.height, distance, d.coeffs, d.acs,
-                         d.adaptive_field, d.field_histogram, d.quant_field, d.calibration,
-                         slot.stream) ||
-        !quantize_scan_residual(d.coeffs, d.acs, d.quant_field, d.calibration, width, height,
-                                d.ytox_map, d.ytob_map, d.ac, d.dc, d.nz_exact, d.nz_grid,
-                                order_history, slot.stream,
-                                submitted == 0 ? -1 : int(submitted % 16))) {
+    const auto frontend_start = Clock::now();
+    bool ready;
+    if (chroma == nullptr) {
+        ready = encode_rgb_frontend(luma, luma_pitch, slot.width, slot.height, distance, d.coeffs,
+                                    d.acs, d.adaptive_field, d.field_histogram, d.quant_field,
+                                    d.calibration, slot.stream);
+    } else {
+        const std::optional<Plane> luma_src{texture_plane(
+            {luma, luma_pitch}, slot.width, slot.height, width, d.aligned_luma, slot.stream)};
+        const std::optional<Plane> chroma_src{
+            texture_plane({chroma, chroma_pitch}, (slot.width + 1) / 2 * 2, (slot.height + 1) / 2,
+                          width, d.aligned_chroma, slot.stream)};
+        if (!luma_src || !chroma_src) {
+            return false;
+        }
+        slot.textures.emplace(luma_src->data, luma_src->pitch, chroma_src->data, chroma_src->pitch,
+                              slot.width, slot.height, slot.stream);
+
+        ready = encode_frontend(*slot.textures, slot.width, slot.height, distance, d.coeffs, d.acs,
+                                d.adaptive_field, d.field_histogram, d.quant_field, d.calibration,
+                                slot.stream);
+    }
+    if (!ready || !quantize_scan_residual(d.coeffs, d.acs, d.quant_field, d.calibration, width,
+                                          height, d.ytox_map, d.ytob_map, d.ac, d.dc, d.nz_exact,
+                                          d.nz_grid, order_history, slot.stream,
+                                          submitted == 0 ? -1 : int(submitted % 16))) {
         return false;
     }
     if (slot.stats != nullptr) {

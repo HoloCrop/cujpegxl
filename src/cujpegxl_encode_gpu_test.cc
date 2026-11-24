@@ -446,6 +446,38 @@ TEST(CujpegxlEncodeGpu, RejectsMissingDevice) {
 
 // Frames come back in submission order with their own outputs; the second
 // frame, submitted after a configure, has the new distance.
+TEST(CujpegxlEncodeGpu, PitchedRgb8PreservesColourAtOddEdges) {
+    const cujpegxl_config config{321, 259, 0.36f};
+    HostNv12 gradient = gradient_nv12(config.width, config.height);
+    const auto rgb = nv12_to_rgb(gradient);
+    DeviceNv12 storage{};
+    size_t pitch;
+    ASSERT_EQ(cudaMallocPitch(&storage.luma, &pitch, 3 * config.width, config.height), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy2D(storage.luma, pitch, rgb.data(), 3 * config.width, 3 * config.width,
+                           config.height, cudaMemcpyHostToDevice),
+              cudaSuccess);
+    cujpegxl_rgb8_input input{storage.luma, pitch, nullptr};
+    size_t bound;
+    ASSERT_EQ(cujpegxl_max_output_size(&config, &bound), CUJPEGXL_OK);
+    std::vector<uint8_t> file(bound);
+    cujpegxl_output output{file.data(), 0, bound};
+    cujpegxl_encoder* encoder = nullptr;
+    ASSERT_EQ(cujpegxl_encoder_create(&config, 0, 1, &encoder), CUJPEGXL_OK);
+    ASSERT_EQ(cujpegxl_encoder_submit_rgb8(encoder, &input, &output), CUJPEGXL_OK);
+    cujpegxl_output* received = nullptr;
+    ASSERT_EQ(cujpegxl_encoder_receive(encoder, &received), CUJPEGXL_OK);
+    cujpegxl_encoder_destroy(encoder);
+    DecodedImage decoded{};
+    ASSERT_TRUE(decode(file.data(), output.size, decoded));
+    ASSERT_EQ(decoded.xs, config.width);
+    ASSERT_EQ(decoded.ys, config.height);
+    ASSERT_EQ(decoded.rgb.size(), rgb.size());
+    int max_error = 0;
+    for (size_t i = 0; i < rgb.size(); ++i)
+        max_error = std::max(max_error, std::abs(int(rgb[i]) - int(decoded.rgb[i])));
+    EXPECT_LE(max_error, 12);
+}
+
 TEST(CujpegxlEncodeGpu, PipelinesFramesInOrder) {
     const cujpegxl_config config{512, 512, 1.0f};
     const cujpegxl_config coarse{512, 512, 4.0f};

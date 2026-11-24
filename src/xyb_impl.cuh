@@ -60,18 +60,8 @@ __device__ inline float clamp01(float v) {
     return fminf(fmaxf(v, 0.0f), 1.0f);
 }
 
-// `yv` is the normalized luma sample; `cb_tex`/`cr_tex` are the normalized
-// (0..1) upsampled chroma samples (texture read). Outputs the raw ToXYB opsin
-// values (not ScaleXYB'd) matching libjxl.
-__device__ inline void nv12_pixel_to_xyb(float yv, float cb_tex, float cr_tex, float& out_x,
-                                         float& out_y, float& out_b) {
-    const float cb{cb_tex - CHROMA_CENTER};
-    const float cr{cr_tex - CHROMA_CENTER};
-
-    const float r{clamp01(srgb_to_linear(clamp01(yv + CR_TO_R * cr)))};
-    const float g{clamp01(srgb_to_linear(clamp01(yv - CB_TO_G * cb - CR_TO_G * cr)))};
-    const float b{clamp01(srgb_to_linear(clamp01(yv + CB_TO_B * cb)))};
-
+__device__ inline void linear_rgb_to_xyb(float r, float g, float b, float& out_x, float& out_y,
+                                         float& out_b) {
     float m0{fmaxf(M00 * r + M01 * g + M02 * b + OPSIN_BIAS, 0.0f)};
     float m1{fmaxf(M10 * r + M11 * g + M12 * b + OPSIN_BIAS, 0.0f)};
     float m2{fmaxf(M20 * r + M21 * g + M22 * b + OPSIN_BIAS, 0.0f)};
@@ -85,6 +75,21 @@ __device__ inline void nv12_pixel_to_xyb(float yv, float cb_tex, float cr_tex, f
     out_x = 0.5f * (m0 - m1);
     out_y = 0.5f * (m0 + m1);
     out_b = m2;
+}
+
+// `yv` is the normalized luma sample; `cb_tex`/`cr_tex` are the normalized
+// (0..1) upsampled chroma samples (texture read). Outputs the raw ToXYB opsin
+// values (not ScaleXYB'd) matching libjxl.
+__device__ inline void nv12_pixel_to_xyb(float yv, float cb_tex, float cr_tex, float& out_x,
+                                         float& out_y, float& out_b) {
+    const float cb{cb_tex - CHROMA_CENTER};
+    const float cr{cr_tex - CHROMA_CENTER};
+
+    const float r{clamp01(srgb_to_linear(clamp01(yv + CR_TO_R * cr)))};
+    const float g{clamp01(srgb_to_linear(clamp01(yv - CB_TO_G * cb - CR_TO_G * cr)))};
+    const float b{clamp01(srgb_to_linear(clamp01(yv + CB_TO_B * cb)))};
+
+    linear_rgb_to_xyb(r, g, b, out_x, out_y, out_b);
 }
 
 }  // namespace cujpegxl

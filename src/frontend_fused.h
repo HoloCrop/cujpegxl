@@ -67,6 +67,12 @@ bool encode_frontend(const Nv12Textures& image, std::size_t width, std::size_t h
                      std::uint32_t* field_histogram, std::int32_t* quant_field,
                      QuantCalibration* calibration, cudaStream_t stream);
 
+bool encode_rgb_frontend(const std::uint8_t* rgb, std::size_t pitch, std::size_t width,
+                         std::size_t height, float distance, __half* coeffs, std::int8_t* acs,
+                         float* adaptive_field, std::uint32_t* field_histogram,
+                         std::int32_t* quant_field, QuantCalibration* calibration,
+                         cudaStream_t stream);
+
 }  // namespace cujpegxl
 
 #endif  // CUJPEGXL_SRC_FRONTEND_FUSED_H_

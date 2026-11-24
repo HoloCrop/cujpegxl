@@ -37,6 +37,25 @@ cujpegxl_status validate_config(const cujpegxl_config& config) {
     return CUJPEGXL_OK;
 }
 
+cujpegxl_status submit_planes(cujpegxl_encoder* encoder, const void* luma, size_t luma_pitch,
+                              const void* chroma, size_t chroma_pitch, void* stream,
+                              cujpegxl_output* output) {
+    const auto& config = encoder->config;
+    cujpegxl::FrameEncoder& frame_encoder{encoder->frame_encoder};
+    const std::size_t in_flight{frame_encoder.in_flight()};
+    if (in_flight == frame_encoder.pipeline_depth()) {
+        return CUJPEGXL_PIPELINE_FULL;
+    }
+    if (!frame_encoder.submit(static_cast<const std::uint8_t*>(luma), luma_pitch,
+                              static_cast<const std::uint8_t*>(chroma), chroma_pitch,
+                              static_cast<cudaStream_t>(stream), config.width, config.height,
+                              config.distance, output->data, output->capacity)) {
+        return CUJPEGXL_INTERNAL_ERROR;
+    }
+    encoder->outputs[(encoder->oldest_output + in_flight) % encoder->outputs.size()] = output;
+    return CUJPEGXL_OK;
+}
+
 }  // namespace
 
 extern "C" {
@@ -140,19 +159,17 @@ cujpegxl_status cujpegxl_encoder_submit(cujpegxl_encoder* encoder, const cujpegx
     if (input->luma_pitch < config.width || input->chroma_pitch < chroma_row_bytes) {
         return CUJPEGXL_INVALID_ARGUMENT;
     }
-    cujpegxl::FrameEncoder& frame_encoder{encoder->frame_encoder};
-    const std::size_t in_flight{frame_encoder.in_flight()};
-    if (in_flight == frame_encoder.pipeline_depth()) {
-        return CUJPEGXL_PIPELINE_FULL;
-    }
-    if (!frame_encoder.submit(static_cast<const std::uint8_t*>(input->luma), input->luma_pitch,
-                              static_cast<const std::uint8_t*>(input->chroma), input->chroma_pitch,
-                              static_cast<cudaStream_t>(input->stream), config.width, config.height,
-                              config.distance, output->data, output->capacity)) {
-        return CUJPEGXL_INTERNAL_ERROR;
-    }
-    encoder->outputs[(encoder->oldest_output + in_flight) % encoder->outputs.size()] = output;
-    return CUJPEGXL_OK;
+    return submit_planes(encoder, input->luma, input->luma_pitch, input->chroma,
+                         input->chroma_pitch, input->stream, output);
+}
+
+cujpegxl_status cujpegxl_encoder_submit_rgb8(cujpegxl_encoder* encoder,
+                                             const cujpegxl_rgb8_input* input,
+                                             cujpegxl_output* output) {
+    if (encoder == nullptr || input == nullptr || input->pixels == nullptr || output == nullptr ||
+        output->data == nullptr || input->pitch < size_t{3} * encoder->config.width)
+        return CUJPEGXL_INVALID_ARGUMENT;
+    return submit_planes(encoder, input->pixels, input->pitch, nullptr, 0, input->stream, output);
 }
 
 cujpegxl_status cujpegxl_encoder_receive(cujpegxl_encoder* encoder, cujpegxl_output** out_output) {

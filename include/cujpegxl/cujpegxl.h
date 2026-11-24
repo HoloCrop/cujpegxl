@@ -21,7 +21,7 @@ extern "C" {
  * intentionally diverge from the C++ naming rules. */
 /* NOLINTBEGIN(modernize-use-using,readability-identifier-naming) */
 
-#define CUJPEGXL_API_VERSION 5u
+#define CUJPEGXL_API_VERSION 6u
 
 typedef enum cujpegxl_status {
     CUJPEGXL_OK = 0,
@@ -60,6 +60,13 @@ typedef struct cujpegxl_nv12_input {
     void* stream;
 } cujpegxl_nv12_input;
 
+/* Interleaved 8-bit sRGB on the GPU; pitch is measured in bytes. */
+typedef struct cujpegxl_rgb8_input {
+    const void* pixels;
+    size_t pitch;
+    void* stream;
+} cujpegxl_rgb8_input;
+
 typedef struct cujpegxl_output {
     uint8_t* data;
     size_t size;
@@ -90,6 +97,10 @@ cujpegxl_status cujpegxl_encoder_configure(cujpegxl_encoder* encoder,
  * its buffer valid, until the frame is received. */
 cujpegxl_status cujpegxl_encoder_submit(cujpegxl_encoder* encoder, const cujpegxl_nv12_input* input,
                                         cujpegxl_output* output);
+/* Same lifetime and stream contract as NV12 submission. */
+cujpegxl_status cujpegxl_encoder_submit_rgb8(cujpegxl_encoder* encoder,
+                                             const cujpegxl_rgb8_input* input,
+                                             cujpegxl_output* output);
 /* Waits for the oldest frame in flight and returns its status;
  * CUJPEGXL_PIPELINE_EMPTY if no frame is in flight. `*out_output` receives the
  * frame's `output` as passed to `cujpegxl_encoder_submit`, with `size` set to
