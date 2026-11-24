@@ -25,26 +25,22 @@ constexpr std::uint32_t RECIPROCAL_PRECISION{32 + ANS_LOG_TAB_SIZE};
 
 // Builds a stream from its end: prepend() puts bits before all bits written so
 // far, so a backward pass over the tokens emits them in forward order. The
-// earliest bits wait in `acc`, full words are stored descending from the slot
-// end.
+// earliest bits wait in acc; complete bytes are committed from the slot end.
 struct BackWriter {
-    std::uint64_t* out{nullptr};
+    std::uint8_t* out{nullptr};
     std::uint64_t acc{0};
-    std::uint32_t fill{0};
+    unsigned fill{0};
 
     void prepend(std::uint64_t bits, std::uint32_t n) {
-        assert(n < 64 && (bits >> n) == 0);
-        // The spare word in the capacity bound makes this store safe even
-        // when it is speculative. Only advance the cursor on overflow.
-        const std::uint32_t total{fill + n};
-        const std::uint32_t excess{total & 63};  // overflow bits when total > 64
-        out[-1] = (acc << ((64 - fill) & 63)) | (bits >> excess);
-        const bool flush{total > 64};
-        out -= flush;
-        fill = total - 64 * flush;
-        // Only the low fill bits are live. The next flush shifts out stale
-        // high bits; store() masks them when publishing the final head.
+        assert(n <= 56 && (bits >> n) == 0);
+        const unsigned total{fill + n};
         acc = (acc << n) | bits;
+        // Place complete bytes at the high end of the store. Any speculative
+        // bytes below the new cursor are overwritten or ignored.
+        const auto bytes{acc << ((64 - total) & 63)};
+        std::memcpy(out - sizeof(bytes), &bytes, sizeof(bytes));
+        out -= total / 8;
+        fill = total % 8;
     }
 };
 
@@ -88,15 +84,28 @@ void start(Lane& lane, const StreamQueue& queue, std::size_t i) {
     lane.raw_pos = s.raw_bits;
     lane.state = ANS_INITIAL_STATE;
     lane.slot_end = queue.slot_words + queue.slot_end[i];
-    lane.out = BackWriter{lane.slot_end};
+    lane.out = BackWriter{reinterpret_cast<std::uint8_t*>(lane.slot_end)};
     lane.stream = i;
 }
 
 void store(const Lane& lane, StreamQueue& queue) {
-    const auto head{lane.out.acc & (~std::uint64_t{0} >> ((64 - lane.out.fill) & 63))};
-    queue.coded[lane.stream] =
-        CodedStream{lane.out.out, static_cast<std::size_t>(lane.slot_end - lane.out.out),
-                    head, lane.out.fill};
+    const auto* pos{lane.out.out};
+    const auto* end{reinterpret_cast<const std::uint8_t*>(lane.slot_end)};
+    unsigned fill{lane.out.fill};
+    std::uint64_t head{lane.out.acc & ((std::uint64_t{1} << fill) - 1)};
+    // Fold leading bytes into the head until the remaining words are aligned.
+    while ((end - pos) % sizeof(head) != 0) {
+        head |= static_cast<std::uint64_t>(*pos++) << fill;
+        fill += 8;
+    }
+    if (fill == 0 && pos != end) {
+        std::memcpy(&head, pos, sizeof(head));
+        pos += sizeof(head);
+        fill = 64;
+    }
+    queue.coded[lane.stream] = CodedStream{reinterpret_cast<const std::uint64_t*>(pos),
+                                          static_cast<std::size_t>(end - pos) / sizeof(head),
+                                          head, fill};
 }
 
 template <typename Step, typename Finish>
@@ -163,8 +172,8 @@ void run_lanes(StreamQueue& queue, Step step, Finish finish) {
 
 std::size_t coded_stream_capacity_words(const TokenStream& stream) {
     // The final state, at most 16 bits of renormalization or prefix code per
-    // token, and the raw bits.
-    return (32 + 16 * stream.num_tokens + stream.raw_bits) / 64 + 1;
+    // token, and the raw bits. Reserve an extra word for speculative byte stores.
+    return (32 + 16 * stream.num_tokens + stream.raw_bits) / 64 + 2;
 }
 
 void code_token_streams(const TokenCode& code, StreamQueue& queue) {
