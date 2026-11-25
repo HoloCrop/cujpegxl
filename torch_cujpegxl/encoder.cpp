@@ -161,7 +161,10 @@ private:
 };
 }  // namespace
 
+void register_decoder(py::module_&);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module, py::mod_gil_not_used()) {
+    register_decoder(module);
     py::class_<Encoder>(module, "Encoder")
         .def(py::init<uint32_t, uint32_t, float, c10::DeviceIndex, uint32_t>(),
              py::arg("width"), py::arg("height"), py::arg("distance"),

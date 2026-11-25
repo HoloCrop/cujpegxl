@@ -1,7 +1,7 @@
-"""Encode full-resolution CUDA RGB tensors as independent JPEG XL files."""
+"""Encode and decode independent camera JPEG XL files with CUDA tensors."""
 
 import torch as torch
 
-from ._native import Encoder
+from ._native import Decoder, Encoder
 
-__all__ = ['Encoder']
+__all__ = ['Decoder', 'Encoder']

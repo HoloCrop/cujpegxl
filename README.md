@@ -33,6 +33,34 @@ files = encoder.encode_batch(images)  # NHWC tensor or sequence of HWC tensors
 
 For continuous capture, keep the encoder alive and call `push(camera_images)` for each frame. Consume the returned files in submission order and call `flush()` once at the end to receive the tail. Keep submitted pixels unchanged until their file is returned. A flush retains the encoder's scan history.
 
+### Torch camera decoder
+
+`Decoder(width, height, device_index=0)` accepts independent RGB8 sRGB files
+from the single-pass HoloCrop 4:2:2 DCT8 camera encoder. CPU workers parse the
+headers and low-frequency data. CUDA decodes independent high-frequency ANS
+groups using shared entropy tables, dequantizes the coefficients and reconstructs
+the training viewport. Camera entropy models outside the shared-memory path
+use a sparse CPU reader and the same GPU reconstruction.
+
+```python
+from torch_cujpegxl import Decoder
+
+decoder = Decoder(width, height)
+rgb = decoder.decode(file)                     # CUDA uint8 [height, width, 3]
+training = decoder.decode_batch(files, maps)   # CUDA uint8 [batch, out_h, out_w, 3]
+```
+
+The optional contiguous CUDA float32 map stores source pixel coordinates
+`(x, y)` at each output pixel, with integer coordinates at pixel centres.
+Pass one `[out_h, out_w, 2]` map for a shared camera calibration or
+`[batch, out_h, out_w, 2]` for individual calibrations. Remapping uses
+OpenCV-style bilinear interpolation and a constant black border. Batch workers
+use independent CUDA streams to overlap parsing, pinned uploads and reconstruction.
+The result is ready in submission order on the caller's Torch stream. CPU parallelism
+follows Torch's intra-op thread setting. Independent loader threads can also decode
+one file each on their own streams. A nonblocking copy into pinned CPU memory lets a
+staging writer overlap readback with the next image.
+
 ## Goals
 
 * Conformance. The encoded image must be readable by any standard-conforming decoder.

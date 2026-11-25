@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch-cujpegxl"
-version = "0.1.2.dev7"
-description = "CUDA tensor bindings for the HoloCrop JPEG XL encoder"
+version = "0.1.2.dev9"
+description = "CUDA tensor bindings for the HoloCrop JPEG XL codec"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.13,<2.14"]
 license = "BSD-3-Clause"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "third_party/jxldec/LICENSE.md"]
 
 [tool.setuptools]
 packages = ["torch_cujpegxl"]
