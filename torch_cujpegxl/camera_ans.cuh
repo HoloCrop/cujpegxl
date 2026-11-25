@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
+#pragma once
+#include "src/camera_decode.h"
 // JPEG XL VarDCT context tables, also present in third_party/jxldec/jxl.c.
 // The bit reader validates untrusted entropy data before consuming each field.
 __constant__ uint32_t coeff_freq_context[63] = {
