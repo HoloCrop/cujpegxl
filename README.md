@@ -1,22 +1,12 @@
-# cujpegxl - CUDA-accelerated JPEG XL encoder
+# HoloCrop cujpegxl
 
-## Experimental RAW pipeline profile
+This fork of [cujpegxl](https://github.com/m-pilia/cujpegxl) adds packed RGB8 input, a camera-profile CUDA decoder and synchronous and asynchronous PyTorch bindings. Each encoded image is a standalone JPEG XL file readable by standard decoders.
 
-This branch records the packed RGB8 encoder evaluated on the RTX 4070 at distance 0.36. The encoder uses native JPEG XL 4:2:2 chroma, fixed 8×8 transforms and a common set of learned coefficient thresholds for apple, grape and cherry. Each output decodes independently with stock djxl. The training objective includes coefficient coding cost, source-domain error, local contrast, RF-DETR sensitivity and frequency-band energy.
+## Camera encoding
 
-The benchmark covers RGB8 renders from native RAW captures. The production wheel remains pinned to its existing revision. NV12, other distances and other GPU architectures have not been qualified for this experimental profile.
+The HoloCrop profile was evaluated on an RTX 4070 at distance 0.36 with RGB8 renders from RAW captures. It uses horizontal 4:2:2 chroma sampling and fixed 8×8 transforms. One set of fitted coefficient thresholds is shared across the evaluated crops. The fitting objective includes coding cost, reconstruction error and RF-DETR sensitivity. The measurements apply to this profile and hardware.
 
-![logo](doc/logo_light.svg)
-
-[![CI](https://github.com/m-pilia/cujpegxl/actions/workflows/ci.yaml/badge.svg)](https://github.com/m-pilia/cujpegxl/actions/workflows/ci.yaml)
-
-This project is a CUDA port of a JPEG XL encoder, implementing a GPU- and real-time-friendly subset of the JPEG XL algorithm.
-
-## HoloCrop scan encoding
-
-Pass packed sRGB on the GPU to `cujpegxl_encoder_submit_rgb8`. This branch preserves the image dimensions, applies centered horizontal 4:2:2 chroma sampling and uses fixed 8×8 transforms. The CropVision scan benchmark uses distance 0.62, three in-flight images per encoder and reusable page-locked host output buffers.
-
-Keep one encoder alive per image shape across a scan. It learns an initial AC codebook from the first image, then updates its codebook and coefficient order from subsequent images. Each pipeline slot reuses its uniform quantization field while the dimensions and distance match. Every output embeds its current codebook and can be decoded independently with a standard JPEG XL decoder.
+Pass interleaved sRGB pixels on the GPU to `cujpegxl_encoder_submit_rgb8`. Keep an encoder per image geometry to reuse its allocations and coefficient-order history across submissions. All information required to decode an image is included in its file.
 
 ### PyTorch CUDA tensors
 
@@ -26,7 +16,7 @@ The `torch-cujpegxl` wheel builds the encoder and tensor binding together agains
 from torch_cujpegxl import Encoder
 
 height, width, _ = image.shape
-encoder = Encoder(width, height, distance=0.92, device_index=image.device.index)
+encoder = Encoder(width, height, distance=0.36, device_index=image.device.index)
 file = encoder.encode(image)
 files = encoder.encode_batch(images)  # NHWC tensor or sequence of HWC tensors
 ```
@@ -36,7 +26,11 @@ For continuous capture, keep the encoder alive and call `push(camera_images)` fo
 ### Torch camera decoder
 
 `Decoder(width, height, device_index=0)` accepts independent RGB8 sRGB files
-from the single-pass HoloCrop 4:2:2 DCT8 camera encoder. CPU workers parse the
+using the supported single-pass 4:2:2 DCT8 camera profile. When accepting arbitrary
+JPEG XL uploads, catch `CameraStreamError` and pass the original bytes to a
+general JPEG XL decoder such as libjxl. CUDA execution errors propagate separately.
+
+CPU workers parse the
 headers and low-frequency data. CUDA decodes independent high-frequency ANS
 groups using shared entropy tables, dequantizes the coefficients and reconstructs
 the training viewport. Camera entropy models outside the shared-memory path
@@ -61,17 +55,36 @@ follows Torch's intra-op thread setting. Independent loader threads can also dec
 one file each on their own streams. A nonblocking copy into pinned CPU memory lets a
 staging writer overlap readback with the next image.
 
-## Goals
+### Asynchronous Torch camera batches
 
-* Conformance. The encoded image must be readable by any standard-conforming decoder.
-* Real-time performance with 4K resolution inputs.
+Use one context-managed codec per image geometry and device. Submit on the CUDA
+stream that produced the inputs. Keep input pixels and remap coordinates
+unmodified until completion. Each submission returns a concurrent future.
+Encoding returns camera files in input order. Decoding returns validated CUDA
+pixels and registers them on the stream calling `result()`.
 
-## Status
+```python
+from torch_cujpegxl import AsyncDecoder, AsyncEncoder
 
-The project is still in an early development stage, and further iterations are required to improve compression quality, runtime performance, feature support, and general robustness.
+with AsyncEncoder(width, height, distance=0.36) as encoder:
+    first = encoder.encode_batch_async(first_camera_set)
+    second = encoder.encode_batch_async(second_camera_set)
+    write_files(first.result())
+    write_files(second.result())
 
-- Current quality/size ratio is close to the reference JPEG XL at mid compression rate, but it falls off a bit at high or low compression settings. Substantially better than JPEG, with 40-60% better compression rate at equal quality, and 5-50% better quality (SSIMULACRA2) at equal compression rate (especially better at higher compression rates), but inferior to the libjxl JPEG XL implementation (on average 15% worse compression rate at comparable quality).
-- Performance is currently limited (it achieves sustained 320 fps at 4K resolution on a GTX 1080Ti + Ryzen 7 2700X). The future ambition would be to sustain 15 fps at 4K resolution using a limited slice (ideally <10%) of an embedded/constrained device (e.g. a Jetson Orin Nano). The HoloCrop branch uses tensor-core DCTs and half-precision frontend operations on Orin and Ada.
+with AsyncDecoder(width, height) as decoder:
+    pixels = decoder.decode_batch_async(camera_files, maps)
+    load_next_frame()
+    consume(pixels.on_current_stream())
+```
+
+For GPU consumers, `on_current_stream()` validates the entropy and queues a CUDA
+event dependency for the render. Use `result()` for host completion.
+
+Import both classes from `torch_cujpegxl`. Two outstanding batches are allowed
+by default. At capacity, submission waits for a slot. Closing drains accepted
+work. Retrieve each future to observe codec errors. A failed encoder must be
+recreated. The decoder can continue after a corrupt batch.
 
 ## Usage
 
@@ -92,42 +105,13 @@ bazelisk build --config=jetson_jp62 //packaging:install_tree
 bazelisk build --config=jetson_jp72 //packaging:install_tree
 ```
 
-## Features
-
-Quality and compression rate are lower compared to the reference libjxl implementation. This is expected, as cujpegxl only implements a subset of the JPEG XL algorithm, excluding some parts of it (in particular, some GPU-unfriendly steps are intentionally omitted for performance reasons).
-
-Notable exclusions include:
-- Scan encoding uses Huffman coding for the AC, DC and AcMetadata sections.
-- LZ77 pre-pass is omitted.
-- No non-square, <8 and >32 transforms.
-- No iterative Butteraugli rate control.
-
-Some numerical approximations are made for performance reasons, trading a bit of quality for speed:
-- Huffman codes limited to 15 bit.
-- Quantization global scale computed from histogram only rather than exact median.
-- Transform selection uses a simpler heuristic.
-- Fuzzy erosion is local (clamped to a 32px tile) as opposed to global.
-- Context clustering uses <=32 clusters (as opposed to libjxl's 128) and a simplified cost model.
-- DCT coefficients stored as FP16.
-- Uniform field quant calibration.
-- Fixed-strength inverse Gaborish pre-sharpening.
-- Simplified CfL estimation.
-
-Some features are not implemented:
-- Modular mode and lossless compression.
-- Single-group frames (or, in general, inputs 256x256 or smaller).
-- Multi-pass encoding.
-- Reference frames.
-- Input pixel formats other than YUV420 NV12.
-- ICC colour profiles.
-
 ## Evaluation tools
 
 A small development set of freely licensed images is bundled in [//data:frames](https://github.com/m-pilia/cujpegxl/tree/master/data). See [data/LICENSE.txt](https://github.com/m-pilia/cujpegxl/blob/master/data/LICENSE.txt) for credits and respective licenses.
 
 The `//eval_dataset` package implements tooling to generate a reproducible evaluation dataset using high-quality and free-license images, while `//tools/quality_benchmark` implements comparative compression quality benchmarking, see [eval_dataset/README.md](https://github.com/m-pilia/cujpegxl/blob/master/eval_dataset/README.md) for information.
 
-Evaluation results using a 100 image subset of the evaluation dataset at 2160p resolution (`bazelisk run //eval_dataset:prepare_dataset -- --resolution 2160p --limit 100 ...`):
+Upstream encoder results using a 100 image subset of the evaluation dataset at 2160p resolution (`bazelisk run //eval_dataset:prepare_dataset -- --resolution 2160p --limit 100 ...`):
 
 ![ssimulacra2](doc/2026-10-29_ssimulacra2.png)
 
@@ -167,37 +151,8 @@ JPEG and JPEG XL are trademarks of their respective owners. cujpegxl is an indep
 
 ## License
 
-The cujpegxl software is made available under a [BSD-3-Clause license](https://raw.githubusercontent.com/m-pilia/cujpegxl/c369abf5f4436c51bab95635b6ac3ca4ad2a7244/LICENSE?token=GHSAT0AAAAAAD7IWYDCTWYTLNESHJQFQP5S2UFY2GA).
+The cujpegxl software is made available under a [BSD-3-Clause license](LICENSE). The camera decoder incorporates [jxldec](third_party/jxldec/README.md), distributed under its [own license](third_party/jxldec/LICENSE.md).
 
 This software is a [derivative work](https://en.wikipedia.org/wiki/Derivative_work) of [libjxl](https://github.com/libjxl/libjxl), the reference JPEG XL implementation, which is made available by its authors [under the same license type](https://github.com/libjxl/libjxl/blob/bdde644b94c125a15e532b2572b96306371a7d4e/LICENSE).
 
 For additional patent rights, see the [PATENTS file in the libjxl source codebase](https://raw.githubusercontent.com/libjxl/libjxl/bdde644b94c125a15e532b2572b96306371a7d4e/PATENTS).
-
-### Asynchronous Torch camera batches
-
-Use one context-managed codec per image geometry and device. Submit on the CUDA
-stream that produced the inputs. Keep input pixels and remap coordinates
-unmodified until completion. Each submission returns a concurrent future.
-Encoding returns camera files in input order. Decoding returns validated CUDA
-pixels and registers them on the stream calling `result()`.
-
-```python
-with AsyncEncoder(width, height, distance=0.36) as encoder:
-    first = encoder.encode_batch_async(first_camera_set)
-    second = encoder.encode_batch_async(second_camera_set)
-    write_files(first.result())
-    write_files(second.result())
-
-with AsyncDecoder(width, height) as decoder:
-    pixels = decoder.decode_batch_async(camera_files, maps)
-    load_next_frame()
-    consume(pixels.on_current_stream())
-```
-
-For GPU consumers, `on_current_stream()` validates the entropy and queues a CUDA
-event dependency for the render. Use `result()` for host completion.
-
-Import both classes from `torch_cujpegxl`. Two outstanding batches are allowed
-by default. At capacity, submission waits for a slot. Closing drains accepted
-work. Retrieve each future to observe codec errors. A failed encoder must be
-recreated. The decoder can continue after a corrupt batch.
