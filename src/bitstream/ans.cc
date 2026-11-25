@@ -272,14 +272,27 @@ void encode_flat_histogram(std::int32_t alphabet_size, W& w) {
     store_var_len_uint8(w, static_cast<std::uint32_t>(alphabet_size - 1));
 }
 
+// Normalized counts have only TABLE_SIZE possible positive values.
+const std::array<float, TABLE_SIZE + 1>& normalized_symbol_cost() {
+    static const auto costs = [] {
+        std::array<float, TABLE_SIZE + 1> result{};
+        for (int count = 1; count <= TABLE_SIZE; ++count) {
+            result[count] = std::max(0.0f, static_cast<float>(ANS_LOG_TAB_SIZE) -
+                                           fast_log2(static_cast<float>(count)));
+        }
+        return result;
+    }();
+    return costs;
+}
+
 float estimate_data_bits(const std::uint32_t* histogram, const Counts& counts,
                          std::int32_t length) {
+    const auto& costs = normalized_symbol_cost();
     float sum{0.0f};
     for (std::int32_t i{0}; i < length; ++i) {
         if (histogram[i] > 0) {
             sum += static_cast<float>(histogram[i]) *
-                   std::max(0.0f, static_cast<float>(ANS_LOG_TAB_SIZE) -
-                                      fast_log2(static_cast<float>(counts[i])));
+                   costs[counts[i]];
         }
     }
     return sum;
