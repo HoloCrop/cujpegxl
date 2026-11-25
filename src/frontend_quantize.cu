@@ -534,8 +534,7 @@ __global__ void quantize_square(
         const unsigned bx=bx0+p%8,by=by0+p/8;
         if(bx<bw&&by<bh){
             const int ydc=tile_dc[1][p],cb=tile_dc[0][p&~1u],cr=tile_dc[2][p&~1u];
-            const int qcol=c==1?bx:(bx&~31u)+(bx%32)/2;
-            const int strength=quant_field[by*bw+qcol];
+            const int strength=quant_field[by*bw+bx];
             const unsigned luma_bin=(ydc>-332)+(ydc>-324)+(ydc>-305)+(ydc>-230)+(ydc>-128)+(ydc>-39)+(ydc>53),cb_bin=(cb>-5),cr_bin=0,field_bin=(strength>4)+(strength>5)+(strength>6);
             const unsigned channel=c<2?c^1:2;
             const unsigned key=(((channel*4+field_bin)*2+cb_bin)*1+cr_bin)*8+luma_bin;
