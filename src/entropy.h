@@ -84,7 +84,7 @@ std::size_t ac_cluster_scratch_bytes();
 // of a thread block per multiprocessor, which the device must support.
 // Deterministic.
 bool ac_cluster_contexts(const std::uint32_t* context_histograms, std::uint8_t* scratch,
-                         AcClustering* clustering, cudaStream_t stream);
+                         AcClustering* clustering, cudaStream_t stream, bool warm=false);
 
 // Upper bounds of a frame's AC tokens and of the 64-bit words of their raw bits
 // in the ac_token_layout.
@@ -100,7 +100,7 @@ std::size_t ac_token_layout_scratch_bytes(std::size_t width, std::size_t height)
 
 // Phase 3: the AC groups' token layout from the phase-1 `item_sizes`. Each AC
 // group (one AcGroup section, raster order) is one token stream: its tokens in
-// decoder order, each an entry cluster << bitstream::TOKEN_CLUSTER_SHIFT |
+// decoder order, each an entry cluster * bitstream::TOKEN_ROW_SIZE +
 // symbol, and their raw bits packed LSB-first from a 64-bit word boundary.
 // `layout` (device, 3 * num_groups + 2 uint32, num_groups = ac_num_groups)
 // receives token_offset[num_groups + 1] (each group's first token, then the

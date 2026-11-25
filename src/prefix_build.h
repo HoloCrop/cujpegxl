@@ -20,7 +20,13 @@ bool build_scan_prefix(AcClustering* model, unsigned* table, cudaStream_t stream
 // per-group emitters can write at a static offset without a prefix sum. The
 // consuming dc_encode_groups reads exactly blob_pre_bits/blob_mid_bits, so the
 // padding between blobs is never emitted.
-constexpr std::size_t DC_BLOB_STRIDE = 256;
+constexpr std::size_t DC_BLOB_STRIDE = 1536;
+
+struct DcPrefixFragment {
+    std::uint32_t words[DC_BLOB_STRIDE / 4];
+    std::uint32_t length;
+    std::uint32_t alphabet;
+};
 
 // On-device DcGroup header-blob build. Per Dc group, from the group's DC histogram
 // `d_dc_hist`, AcMetadata histogram `d_am_hist` (each num_dc_groups *
@@ -32,7 +38,7 @@ constexpr std::size_t DC_BLOB_STRIDE = 256;
 // (num_dc_groups * HISTOGRAM_STRIDE). All work is enqueued on `stream`.
 // Deterministic. Returns false on a CUDA error.
 bool build_dc_group_blobs_device(std::size_t width, std::size_t height,
-                                 const std::int32_t* qf, const std::uint32_t* d_dc_hist, const std::uint32_t* d_am_hist,
+                                 DcPrefixFragment* fragments, bool initialize_headers, const std::int32_t* qf, const std::uint32_t* d_dc_hist, const std::uint32_t* d_am_hist,
                                  const std::size_t* d_fbc, std::uint8_t* d_dc_depth,
                                  std::uint16_t* d_dc_bits, std::uint8_t* d_am_depth,
                                  std::uint16_t* d_am_bits, std::uint8_t* d_blob_pre,

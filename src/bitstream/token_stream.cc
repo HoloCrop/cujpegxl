@@ -200,13 +200,16 @@ void code_token_streams(const TokenCode& code, StreamQueue& queue) {
         [ans, reverse_map](Lane& lane) {
             --lane.entry;
             const AnsEntryCode c{ans[*lane.entry]};
-            lane.raw_pos -= c.raw_bits;
-            const auto raw{read_raw(lane.raw, lane.raw_pos, c.raw_bits)};
             std::uint32_t x{lane.state};
             const bool renormalize{(x >> (32 - ANS_LOG_TAB_SIZE)) >= c.freq};
             const unsigned shift{renormalize ? 16u : 0u};
-            lane.out.prepend((static_cast<std::uint64_t>(raw) << shift) | (renormalize ? x & 0xffff : 0),
-                             c.raw_bits + shift);
+            if (c.raw_bits != 0) {
+                lane.raw_pos -= c.raw_bits;
+                const auto raw{read_raw(lane.raw, lane.raw_pos, c.raw_bits)};
+                lane.out.prepend((static_cast<std::uint64_t>(raw) << shift) | (renormalize ? x & 0xffff : 0), c.raw_bits + shift);
+            } else if (renormalize) {
+                lane.out.prepend(x & 0xffff, 16);
+            }
             x >>= shift;
             const auto v{static_cast<std::uint32_t>((x * c.reciprocal) >> RECIPROCAL_PRECISION)};
             lane.state = (v << ANS_LOG_TAB_SIZE) + reverse_map[c.slot + x - v * c.freq];

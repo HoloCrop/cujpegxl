@@ -11,9 +11,10 @@
 
 namespace cujpegxl::bitstream {
 
-// A token is an entry `cluster << TOKEN_CLUSTER_SHIFT | symbol` plus the raw
+// A token is an entry `cluster * TOKEN_ROW_SIZE + symbol` plus the raw
 // bits of its hybrid-uint value, whose count follows from the symbol.
-constexpr std::uint32_t TOKEN_CLUSTER_SHIFT{8};
+// One padding entry shifts consecutive histogram rows across cache sets.
+constexpr std::uint32_t TOKEN_ROW_SIZE{65};
 
 // rANS code of one entry: its symbol's frequency, the 64-bit reciprocal of
 // libjxl's PutSymbol and the index of its first slot in TokenCode::reverse_map.

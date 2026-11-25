@@ -50,6 +50,11 @@ CUJPEGXL_VL_HD inline std::size_t padded_to_blocks(std::size_t pixels) {
     return (pixels + 7) / 8 * 8;
 }
 
+// Horizontal 4:2:2 samples cover two luma blocks per chroma block.
+CUJPEGXL_VL_HD inline std::size_t padded_422_width(std::size_t pixels) {
+    return (pixels + 15) / 16 * 16;
+}
+
 // Side lengths, in 8x8 blocks, of the square AC groups (256px) and DC groups
 // (2048px) tiling a frame; edge groups are partial.
 constexpr std::size_t AC_GROUP_BLOCKS = 32;

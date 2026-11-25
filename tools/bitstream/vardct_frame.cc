@@ -402,7 +402,7 @@ AcReference build_ac_reference(const FrameCoefficients& fc, std::size_t bw, std:
         for (std::size_t i{range.first}; i < range.second; ++i) {
             const AcTok& t{toks[i]};
             entries.push_back(static_cast<std::uint16_t>(
-                ref.clustering.context_map[t.context] << TOKEN_CLUSTER_SHIFT | t.symbol));
+                ref.clustering.context_map[t.context] * TOKEN_ROW_SIZE + t.symbol));
             for (std::uint32_t b{0}; b < t.nbits; ++b) {
                 if (raw_bits / 64 + 1 >= raw.size()) {
                     raw.push_back(0);

@@ -398,11 +398,84 @@ __device__ void warp_write_modular_tree(SharedBitWriter& w, const detail::TreeTo
     }
 }
 
+__device__ void store_fragment(DcPrefixFragment& fragment, const unsigned* words, unsigned length,
+                               unsigned alphabet, unsigned lane) {
+    for (unsigned i = lane; i < (length + 31) / 32; i += 32)
+        fragment.words[i] = words[i];
+    if (lane == 0) {
+        fragment.length = length;
+        fragment.alphabet = alphabet;
+    }
+}
+
+__device__ void append_fragment(SharedBitWriter& w, const DcPrefixFragment& fragment, unsigned lane) {
+    const unsigned length = fragment.length;
+    for (unsigned i = lane * 32; i < length; i += 32 * 32) {
+        SharedBitWriter field{w.words, w.pos + i, true};
+        field.write(min(32u, length - i), fragment.words[i / 32]);
+    }
+    w.pos += length;
+}
+
+__global__ void fixed_dc_headers(DcPrefixFragment* fragments) {
+    __shared__ DcBlobScratch s;
+    const unsigned lane = threadIdx.x;
+    for (unsigned i = lane; i < DC_BLOB_STRIDE / 4; i += 32) s.words[i] = 0;
+    __syncwarp();
+    SharedBitWriter w{s.words, 0, lane == 0};
+    if (blockIdx.x == 1) {
+        detail::TreeTokens mt{{1,4},2}; // Channel > 2, then channel > 1, then row > 0.
+        detail::append_leaf(mt,0);
+        mt.values[mt.count++]=1;mt.values[mt.count++]=2;
+        mt.values[mt.count++]=3;mt.values[mt.count++]=0;
+        detail::append_leaf(mt,0);detail::append_leaf(mt,0);detail::append_leaf(mt,0);
+        warp_write_modular_tree(w,mt,s,lane);
+        w.write(1,0);
+        const std::uint8_t mapping[4]={0,0,1,0};
+        detail::write_simple_context_map(w,mapping,4,2);
+        w.write(1,1);
+        detail::encode_uint_config(w,HybridUintConfig{},detail::PREFIX_MAX_BITS);
+        detail::encode_uint_config(w,HybridUintConfig{},detail::PREFIX_MAX_BITS);
+    } else {
+        bitstream::write_bits(w,2,0);
+        detail::TreeTokens tree{{1,0,5,8,11,12,12,14,6,6,13,14,11,13,0,5,0,0,0,12,15,0,2,0,0,0,0,3,0,0,0,0,5,0,0,0,13,15,12,14,13,14,0,3,0,0,0,0,5,0,0,0,0,5,0,0,0,0,5,0,0,0,0,5,0,0,0,12,15,0,5,0,0,0,13,15,0,3,0,0,0,0,5,0,0,0,0,5,0,0,0,0,5,0,0,0},96};
+        warp_write_modular_tree(w,tree,s,lane);
+        const std::uint8_t mapping[]={3,1,0,7,2,3,6,7,5,7,4,5,6,7};
+        w.write(1,0);detail::write_simple_context_map(w,mapping,14,8);w.write(1,1);
+        for(int c=0;c<8;++c)detail::encode_uint_config(w,HybridUintConfig{},detail::PREFIX_MAX_BITS);
+    }
+    __syncwarp();
+    store_fragment(fragments[blockIdx.x], s.words, w.pos, 0, lane);
+}
+
+__global__ void dc_code_fragments(const std::uint32_t* dc_hist, DcPrefixFragment* fragments,
+                                  std::uint8_t* depth, std::uint16_t* bits) {
+    __shared__ DcBlobScratch s;
+    const unsigned c = blockIdx.x;
+    const unsigned lane = threadIdx.x;
+    for (unsigned i = lane; i < DC_BLOB_STRIDE / 4; i += 32) s.words[i] = 0;
+    for (unsigned i = lane; i < 64; i += 32) {
+        s.data.code.hist[i] = dc_hist[c * 64 + i];
+        s.data.code.depth[i] = 0;
+        s.data.code.bits[i] = 0;
+    }
+    __syncwarp();
+    SharedBitWriter w{s.words, 0, lane == 0};
+    const unsigned length = summarize_histogram(s.data.code.hist, 64, lane).alphabet;
+    warp_write_prefix_code(s.data.code, length, w, s.data.code_length, s.data.tree, lane);
+    __syncwarp();
+    for (unsigned i = lane; i < 64; i += 32) {
+        depth[c * 64 + i] = s.data.code.depth[i];
+        bits[c * 64 + i] = s.data.code.bits[i];
+    }
+    store_fragment(fragments[2 + c], s.words, w.pos, length, lane);
+}
+
 // One warp per (Dc group, blob): even blocks build the group's pre blob (DC
 // prefix code), odd blocks its mid blob (AcMetadata prefix code). Mirrors
 // detail::serialize_dc_pre / serialize_dc_mid.
 __global__ void dc_group_blobs_kernel(std::size_t bw, std::size_t bh, std::size_t xdg,
-                                      const std::int32_t* qf, const std::uint32_t* dc_hist, const std::uint32_t* am_hist,
+                                      const DcPrefixFragment* fragments, const std::uint32_t* dc_hist, const std::uint32_t* am_hist,
                                       const std::size_t* fbc, std::uint8_t* dc_depth,
                                       std::uint16_t* dc_bits, std::uint8_t* am_depth,
                                       std::uint16_t* am_bits, std::uint8_t* blob_pre,
@@ -414,7 +487,7 @@ __global__ void dc_group_blobs_kernel(std::size_t bw, std::size_t bh, std::size_
     const std::size_t g{blockIdx.x / 2};
     const bool mid{(blockIdx.x & 1) != 0};
 
-    load_histogram((mid ? am_hist : dc_hist) + g * HISTOGRAM_STRIDE, s.data.code, lane);
+    if (mid) load_histogram(am_hist + g * HISTOGRAM_STRIDE, s.data.code, lane);
     for (std::size_t i{lane}; i < DC_BLOB_STRIDE / 4; i += CODE_THREADS) {
         s.words[i] = 0;
     }
@@ -434,48 +507,19 @@ __global__ void dc_group_blobs_kernel(std::size_t bw, std::size_t bh, std::size_
         bitstream::write_bits(w, detail::ceil_log2_nonzero(dgw * dgh),
                               static_cast<std::uint32_t>(fbc[g] - 1));
 
-        detail::TreeTokens mt{{1,4},2}; // Channel > 2, then channel > 1, then row > 0.
-        detail::append_leaf(mt,0);
-        mt.values[mt.count++]=1;mt.values[mt.count++]=2;
-        mt.values[mt.count++]=3;mt.values[mt.count++]=0;
-        detail::append_leaf(mt,0);detail::append_leaf(mt,0);detail::append_leaf(mt,0);
-        warp_write_modular_tree(w,mt,s,lane);
-        w.write(1,0);
-        const std::uint8_t mapping[4]={0,0,1,0};
-        detail::write_simple_context_map(w,mapping,4,2);
-        w.write(1,1);
-        detail::encode_uint_config(w,HybridUintConfig{},detail::PREFIX_MAX_BITS);
-        detail::encode_uint_config(w,HybridUintConfig{},detail::PREFIX_MAX_BITS);
+        append_fragment(w, fragments[1], lane);
         const auto data=summarize_histogram(s.data.code.hist,HISTOGRAM_STRIDE,lane);
         detail::store_var_len_uint16(w,0);detail::store_var_len_uint16(w,data.alphabet-1);
         warp_write_prefix_code(s.data.code,data.alphabet,w,s.data.code_length,s.data.tree,lane);
         __syncwarp();
         store_code(s.data.code,am_depth+g*HISTOGRAM_STRIDE,am_bits+g*HISTOGRAM_STRIDE,lane);
     } else {
-        bitstream::write_bits(w,2,0);
-        detail::TreeTokens tree{{1,0,11,6,11,6},6};
-        for(int k=0;k<2;++k){
-            detail::append_leaf(tree,DC_PREDICTOR_GRADIENT);
-            tree.values[tree.count++]=11;tree.values[tree.count++]=7;
-        }
-        for(int k=0;k<4;++k)detail::append_leaf(tree,DC_PREDICTOR_GRADIENT);
-        warp_write_modular_tree(w,tree,s,lane);
-        const unsigned* h=dc_hist+g*HISTOGRAM_STRIDE;
-        const std::uint8_t mapping[]={0,2,1,0,3,2};
-        w.write(1,0);detail::write_simple_context_map(w,mapping,6,4);w.write(1,1);
-        unsigned lengths[4];
-        for(int c=0;c<4;++c)detail::encode_uint_config(w,HybridUintConfig{},detail::PREFIX_MAX_BITS);
-        for(int c=0;c<4;++c){lengths[c]=max(1u,(unsigned)summarize_histogram(h+c*64,64,lane).alphabet);detail::store_var_len_uint16(w,lengths[c]-1);}
-        for(int c=0;c<4;++c){
-            for(unsigned i=lane;i<64;i+=32){
-                s.data.code.hist[i]=h[c*64+i];s.data.code.depth[i]=0;s.data.code.bits[i]=0;
-            }
-            __syncwarp();warp_write_prefix_code(s.data.code,lengths[c],w,s.data.code_length,s.data.tree,lane);__syncwarp();
-            for(unsigned i=lane;i<64;i+=32){
-                dc_depth[g*256+c*64+i]=s.data.code.depth[i];dc_bits[g*256+c*64+i]=s.data.code.bits[i];
-            }
-            __syncwarp();
-        }
+        append_fragment(w, fragments[0], lane);
+        const DcPrefixFragment* group = fragments + 2 + g * 8;
+        for (unsigned c = 0; c < 8; ++c)
+            detail::store_var_len_uint16(w, group[c].alphabet - 1);
+        for (unsigned c = 0; c < 8; ++c)
+            append_fragment(w, group[c], lane);
     }
     assert(w.pos <= DC_BLOB_STRIDE * 8);
     __syncwarp();
@@ -527,7 +571,7 @@ bool build_scan_prefix(AcClustering* model, unsigned* table, cudaStream_t stream
     return cudaGetLastError() == cudaSuccess;
 }
 bool build_dc_group_blobs_device(std::size_t width, std::size_t height,
-                                 const std::int32_t* qf, const std::uint32_t* d_dc_hist, const std::uint32_t* d_am_hist,
+                                 DcPrefixFragment* fragments, bool initialize_headers, const std::int32_t* qf, const std::uint32_t* d_dc_hist, const std::uint32_t* d_am_hist,
                                  const std::size_t* d_fbc, std::uint8_t* d_dc_depth,
                                  std::uint16_t* d_dc_bits, std::uint8_t* d_am_depth,
                                  std::uint16_t* d_am_bits, std::uint8_t* d_blob_pre,
@@ -540,8 +584,10 @@ bool build_dc_group_blobs_device(std::size_t width, std::size_t height,
     const std::size_t ydg{ceil_div(bh, DC_GROUP_BLOCKS)};
     const std::size_t num_groups{xdg * ydg};
 
+    if (initialize_headers) fixed_dc_headers<<<2, CODE_THREADS, 0, stream>>>(fragments);
+    dc_code_fragments<<<8 * num_groups, CODE_THREADS, 0, stream>>>(d_dc_hist, fragments, d_dc_depth, d_dc_bits);
     dc_group_blobs_kernel<<<static_cast<unsigned int>(2 * num_groups), CODE_THREADS, 0, stream>>>(
-        bw, bh, xdg, qf, d_dc_hist, d_am_hist, d_fbc, d_dc_depth, d_dc_bits, d_am_depth, d_am_bits,
+        bw, bh, xdg, fragments, d_dc_hist, d_am_hist, d_fbc, d_dc_depth, d_dc_bits, d_am_depth, d_am_bits,
         d_blob_pre, d_blob_pre_off, d_blob_pre_bits, d_blob_mid, d_blob_mid_off, d_blob_mid_bits);
     return cudaGetLastError() == cudaSuccess;
 }

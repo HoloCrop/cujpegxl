@@ -82,7 +82,7 @@ Streams prepare(std::vector<std::vector<Token>> tokens) {
             config.encode(t.value, symbol, nbits, bits);
             const std::uint32_t cluster{test_cluster(t.context)};
             ++s.clustering.histograms[cluster * AC_CONTEXT_ALPHABET + symbol];
-            entries.push_back(static_cast<std::uint16_t>(cluster << TOKEN_CLUSTER_SHIFT | symbol));
+            entries.push_back(static_cast<std::uint16_t>(cluster * TOKEN_ROW_SIZE + symbol));
             for (std::uint32_t b{0}; b < nbits; ++b) {
                 if (raw_bits / 64 + 1 >= raw.size()) {
                     raw.push_back(0);

@@ -66,8 +66,8 @@ std::vector<std::uint8_t> write_vardct_codestream(const FrameCoefficients& fc);
 // `orders` by coeff_orders_reference, the per-context histograms of the real
 // per-token contexts (`context_histograms`, context * AC_CONTEXT_ALPHABET +
 // symbol) and their `clustering` by cluster_ac_contexts_reference. Per AC group (one AcGroup TOC
-// section, raster order) it carries the token stream the device must pack, entries cluster <<
-// TOKEN_CLUSTER_SHIFT | symbol and their `group_raw_bits` raw bits packed
+// section, raster order) it carries the token stream the device must pack, entries cluster *
+// TOKEN_ROW_SIZE + symbol and their `group_raw_bits` raw bits packed
 // LSB-first in `group_raw` (with a zero word past the last), and the group
 // section coded with the production AcGlobal code (`ac_global`). This is exactly what
 // write_vardct_codestream(fc) emits for the AcGlobal and AC groups of a

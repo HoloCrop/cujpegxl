@@ -415,14 +415,17 @@ void build_reverse_map(const Counts& counts, std::int32_t alphabet_size, std::si
         out.offset[s] = static_cast<std::uint16_t>(offset);
         offset += static_cast<std::uint32_t>(counts[s]);
     }
-    for (std::uint32_t value{0}; value < ANS_TAB_SIZE; ++value) {
-        const AliasEntry& e{entries[value >> log_entry_size]};
-        const std::uint32_t pos{value & (entry_size - 1)};
-        const bool greater{pos >= e.cutoff};
-        const std::uint32_t symbol{greater ? e.right_value : value >> log_entry_size};
-        const std::uint32_t slot{(greater ? e.offsets1 : 0) + pos};
-        assert(slot < out.freq[symbol]);
-        out.reverse_map[out.offset[symbol] + slot] = static_cast<std::uint16_t>(value);
+    // Each alias bucket has two linear runs in the symbol's reverse map.
+    for (std::uint32_t bucket{0}; bucket < table_size; ++bucket) {
+        const AliasEntry& entry{entries[bucket]};
+        const auto base{bucket << log_entry_size};
+        for (std::uint32_t pos{0}; pos < entry.cutoff; ++pos) {
+            out.reverse_map[out.offset[bucket] + pos] = static_cast<std::uint16_t>(base + pos);
+        }
+        const auto start{out.offset[entry.right_value] + entry.offsets1 + entry.cutoff};
+        for (std::uint32_t pos{0}; pos < entry_size - entry.cutoff; ++pos) {
+            out.reverse_map[start + pos] = static_cast<std::uint16_t>(base + entry.cutoff + pos);
+        }
     }
 }
 

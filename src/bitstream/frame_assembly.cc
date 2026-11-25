@@ -1,3 +1,4 @@
+#include "src/trained_block_contexts.h"
 // Copyright (c) 2026 Martino Pilia
 // SPDX-License-Identifier: BSD-3-Clause
 
@@ -136,12 +137,19 @@ std::vector<std::uint8_t> build_dc_global(const QuantParams& qp) {
     write_bool(w,false);write_bits(w,16,14522);write_bits(w,16,14522);write_bits(w,16,14522);
     write_u32(w, GLOBAL_SCALE_ENC, qp.global_scale);
     write_u32(w, QUANT_DC_ENC, qp.quant_dc);  // Quantizer::Decode
-    write_bool(w,false);w.write(4,0);w.write(4,4);
-    constexpr U32Enc thresholds{{Bits(4),BitsOffset(8,16),BitsOffset(16,272),BitsOffset(32,65808)}};
-    for(int v:{-332,-313,-104,25})write_u32(w,thresholds,v<0?(-2*v-1):2*v);
-    w.write(4,0);w.write(4,0);
-    uint8_t contexts[3*13*5];
-    for(unsigned i=0;i<3*13*5;++i)contexts[i]=(i/(13*5))*5+i%5;
+    write_bool(w,false);
+    constexpr U32Enc dc_dist{{Bits(4),BitsOffset(8,16),BitsOffset(16,272),BitsOffset(32,65808)}};
+    constexpr U32Enc quant_dist{{Bits(2),BitsOffset(3,4),BitsOffset(5,12),BitsOffset(8,44)}};
+    w.write(4,1);
+    for(int v:{-5})write_u32(w,dc_dist,v<0?(-2*v-1):2*v);
+    w.write(4,7);
+    for(int v:{-332,-324,-305,-230,-128,-39,53})write_u32(w,dc_dist,v<0?(-2*v-1):2*v);
+    w.write(4,0);
+    w.write(4,3);
+    for(int v:{4,5,6})write_u32(w,quant_dist,v-1);
+    constexpr uint8_t trained[]={CUJPEGXL_BLOCK_CONTEXTS};
+    uint8_t contexts[3*13*64];
+    for(unsigned i=0;i<sizeof(contexts);++i)contexts[i]=trained[(i/(13*64))*64+i%64];
     detail::write_best_prefix_context_map(w,contexts,sizeof(contexts),15);
     write_bool(w, false); // independent YCbCr planes at DC
     write_bits(w, 2, 0);
@@ -196,7 +204,8 @@ AcGlobalBuilder::AcGlobalBuilder(const AcClustering& clustering, const CoeffOrde
     }
     code.use_prefix_code = total < MIN_ANS_TOKENS || single_symbols;
     log_alpha_size_ = std::max<std::size_t>(5, detail::ceil_log2_nonzero(max_alphabet));
-    const std::size_t num_entries{num_clusters() << TOKEN_CLUSTER_SHIFT};
+    static_assert(TOKEN_ROW_SIZE == AC_CONTEXT_ALPHABET + 1);
+    const std::size_t num_entries{num_clusters() * TOKEN_ROW_SIZE};
     if (code.use_prefix_code) {
         code.ans.clear();
         code.reverse_map.clear();
@@ -223,7 +232,7 @@ void AcGlobalBuilder::build_cluster(std::size_t c) {
     constexpr std::uint64_t ONE{std::uint64_t{1} << (32 + ANS_LOG_TAB_SIZE)};
     for (std::size_t s{0}; s < AC_CONTEXT_ALPHABET; ++s) {
         const std::uint64_t freq{ans.freq[s]};
-        code_.ans[(c << TOKEN_CLUSTER_SHIFT) | s] = AnsEntryCode{
+        code_.ans[c * TOKEN_ROW_SIZE + s] = AnsEntryCode{
             freq != 0 ? (ONE + freq - 1) / freq : 0,
             static_cast<std::uint32_t>(c * ANS_TAB_SIZE + ans.offset[s]),
             static_cast<std::uint16_t>(freq),
@@ -257,7 +266,7 @@ std::vector<std::uint8_t> AcGlobalBuilder::finish() {
         for (std::size_t c{0}; c < num_clusters(); ++c) {
             for (std::size_t s{0}; s < AC_CONTEXT_ALPHABET; ++s) {
                 const std::size_t i{c * AC_CONTEXT_ALPHABET + s};
-                code_.prefix[(c << TOKEN_CLUSTER_SHIFT) | s] = PrefixEntryCode{
+                code_.prefix[c * TOKEN_ROW_SIZE + s] = PrefixEntryCode{
                     bits[i], depth[i],
                     static_cast<std::uint8_t>(config.raw_bits(static_cast<std::uint32_t>(s)))};
             }

@@ -300,6 +300,7 @@ __device__ inline int dct32_lane_fy(int part, int lane, int m) {
 // Only the chosen transforms' Y coefficients are stored to y_plane. Inlined, it
 // keeps the kernel's range of tid, so the lane and warp arithmetic stays
 // unsigned.
+template<int RowsOffset=SELECT_ROWS8_OFFSET>
 __device__ __forceinline__ std::uint32_t select_transforms(float* __restrict__ select,
                                                            std::size_t rbx, std::size_t rby,
                                                            std::size_t bw, int tile_bw, int tile_bh,
@@ -308,7 +309,7 @@ __device__ __forceinline__ std::uint32_t select_transforms(float* __restrict__ s
                                                            __half* __restrict__ y_plane, int tid) {
     const int lane = tid % 32;
     const int column = tid / 32;
-    float* rows = select + SELECT_ROWS8_OFFSET;
+    float* rows = select + RowsOffset;
     if (column < 4) {
         float values[8];
         dct_vector<8,8>(select + lane*TILE_STRIDE + column*8, 0, values);
@@ -707,6 +708,47 @@ __device__ void rgb422_to_xyb(Rgb8View image, int x, int y, int width,
     out_y=(yy-128)*(1.f/255.f);
 }
 
+// The fixed DCT8 RGB frontend needs one luma workspace and two chroma tiles.
+constexpr size_t RGB_LUMA_FLOATS=TILE_FLOATS+128*9;
+constexpr size_t RGB_TILE_BYTES=(RGB_LUMA_FLOATS+2*TILE_FLOATS)*sizeof(float);
+static_assert(RGB_LUMA_FLOATS>=2*REGION_ROWS_FLOATS);
+__device__ inline void compact_rgb_tile(Rgb8View image,int width,int height,size_t bw,size_t bh,
+        float mul_pb,__half* coeffs,int8_t* acs,float* adaptive_field,uint32_t* histogram,float* scratch){
+    const int tid=threadIdx.x,lane=tid%32,warp=tid/32;
+    const size_t bx=blockIdx.x*TB,by=blockIdx.y*TB,plane=bw*bh*64;
+    const int cols=int(min(bw-bx,size_t(TB))),rows=int(min(bh-by,size_t(TB)));
+    float* cb_tile=scratch+RGB_LUMA_FLOATS;
+    float* cr_tile=cb_tile+TILE_FLOATS;
+    const int x=min(int(bx*8)+lane,width-1);
+    #pragma unroll
+    for(int i=tid;i<TILE_SAMPLES;i+=FRONTEND_THREADS){
+        const int row=i/32,sy=min(int(by*8)+row,height-1);
+        const auto* pixels=reinterpret_cast<const uchar3*>(image.pixels+size_t(sy)*image.pitch);
+        const auto v=pixels[x];
+        const int y=(19595*v.x+38470*v.y+7471*v.z+32768)>>16;
+        const int cb=(32768*v.z-11059*v.x-21709*v.y+8421375)>>16;
+        const int cr=(32768*v.x-27439*v.y-5329*v.z+8421375)>>16;
+        const int pair=(x&16)+2*(x&7);
+        const unsigned uv=unsigned(cb)|(unsigned(cr)<<16);
+        const unsigned sum=__shfl_sync(~0u,uv,pair)+__shfl_sync(~0u,uv,pair+1);
+        const int idx=row*TILE_STRIDE+lane;
+        scratch[idx]=(y-128)*(1.f/255.f);
+        cb_tile[idx]=__half2float(__float2half_rn((x&8)?0.f:(int(((sum&65535)+1)/2)-128)*(1.f/255.f)));
+        cr_tile[idx]=__half2float(__float2half_rn((x&8)?0.f:(int(((sum>>16)+1)/2)-128)*(1.f/255.f)));
+    }
+    if(adaptive_field!=nullptr && tid<TB*TB && tid%TB<cols && tid/TB<rows)
+        adaptive_field[(by+tid/TB)*bw+bx+tid%TB]=mul_pb;
+    if(adaptive_field!=nullptr && blockIdx.x==0 && blockIdx.y==0 && tid==0)
+        histogram[field_bin(mul_pb)]=uint32_t(bw*bh);
+    __syncthreads();
+    const unsigned layout=select_transforms<TILE_FLOATS>(scratch,bx,by,bw,cols,rows,0.f,0.f,acs,coeffs+plane,tid);
+    __syncthreads();
+    float* cb_out=scratch;float* cr_out=scratch+REGION_ROWS_FLOATS;
+    region_coeffs_mma({cb_tile,cr_tile},layout,{cb_out,cr_out},warp,lane);
+    __syncthreads();
+    store_region_coeffs({cb_out,cr_out},layout,bx,by,bw,cols,rows,{coeffs,coeffs+2*plane},tid);
+}
+
 template <typename View>
 __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPILED_ARCH])
     frontend_fused_kernel(View image, std::size_t width, std::size_t height, std::size_t bw,
@@ -714,7 +756,13 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
                           float add_pb, float qgsf, __half* __restrict__ coeffs,
                           std::int8_t* __restrict__ acs, float* __restrict__ adaptive_field,
                           std::uint32_t* __restrict__ field_histogram) {
-    extern __shared__ __align__(16) unsigned char workspace_bytes[];
+    constexpr bool compact=std::is_same_v<View,Rgb8View> && DCT_MMA;
+    __shared__ __align__(16) unsigned char workspace_bytes[compact?RGB_TILE_BYTES:WORKSPACE_BYTES];
+    if constexpr(compact){
+        compact_rgb_tile(image,int(width),int(height),bw,bh,mul_pb,coeffs,acs,adaptive_field,
+                         field_histogram,reinterpret_cast<float*>(workspace_bytes));
+        return;
+    }
     float* workspace{reinterpret_cast<float*>(workspace_bytes)};
     float* sharp_y{workspace};
     float* raw_x{workspace + RESIDENT_X_B_OFFSET};
@@ -874,7 +922,7 @@ template <typename View>
 bool encode_view(View image, std::size_t width, std::size_t height, float distance, __half* coeffs,
                  std::int8_t* acs, float* adaptive_field, std::uint32_t* field_histogram,
                  std::int32_t* quant_field, QuantCalibration* calibration, cudaStream_t stream, bool initialize_field) {
-    const std::size_t bw{padded_to_blocks(width) / 8};
+    const std::size_t bw{padded_422_width(width) / 8};
     const std::size_t bh{padded_to_blocks(height) / 8};
     const std::uint32_t blocks{static_cast<std::uint32_t>(bw * bh)};
 
@@ -918,7 +966,7 @@ bool encode_view(View image, std::size_t width, std::size_t height, float distan
     const dim3 block{FRONTEND_THREADS};
     const dim3 grid{static_cast<unsigned int>((bw + TB - 1) / TB),
                     static_cast<unsigned int>((bh + TB - 1) / TB)};
-    frontend_fused_kernel<<<grid, block, WORKSPACE_BYTES, stream>>>(
+    frontend_fused_kernel<<<grid, block, 0, stream>>>(
         image, width, height, bw, bh, km0, km1, km2, km3, mul_pb, add_pb, qgsf, coeffs, acs,
         initialize_field ? adaptive_field : nullptr, field_histogram);
     if (!initialize_field) {

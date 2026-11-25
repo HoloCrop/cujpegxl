@@ -27,7 +27,7 @@ namespace cujpegxl {
 // An AC symbol is below 64: a coefficient token codes the PackSigned value of an
 // int16 (at most 65535, token 63), a non-zero-count token at most 1008.
 inline constexpr std::size_t AC_CONTEXT_ALPHABET = 64;
-inline constexpr std::size_t AC_MAX_CLUSTERS = 32;
+inline constexpr std::size_t AC_MAX_CLUSTERS = 64;
 inline constexpr int AC_CLUSTER_LLOYD_ITERATIONS = 4;
 inline constexpr int AC_CLUSTER_REFILL_ITERATION = 2;
 static_assert(AC_CLUSTER_REFILL_ITERATION > 0 &&
@@ -46,7 +46,7 @@ CUJPEGXL_ACC_HD inline std::uint32_t ac_initial_cluster(std::uint32_t context) {
         const std::uint32_t channel_group{context % AC_NUM_BLOCK_CTX < 7 ? 0u : 1u};
         const std::uint32_t band{
             nonzero_bucket < 4 ? 0u : (nonzero_bucket < 12 ? 1u : (nonzero_bucket < 24 ? 2u : 3u))};
-        return channel_group * 4 + band;
+        return channel_group * 4 + band + 32 * ((context % AC_NUM_BLOCK_CTX) & 1u);
     }
     const std::uint32_t rel{context - count_contexts};
     const std::uint32_t channel_group{rel / AC_ZERO_DENSITY_COUNT < 7 ? 0u : 1u};
@@ -63,7 +63,7 @@ CUJPEGXL_ACC_HD inline std::uint32_t ac_initial_cluster(std::uint32_t context) {
                              : zdc < 376 ? 9u
                              : zdc < 424 ? 10u
                                          : 11u};
-    return 8 + channel_group * 12 + band;
+    return 8 + channel_group * 12 + band + 32 * ((rel / AC_ZERO_DENSITY_COUNT) & 1u);
 }
 
 // log2(1 + i / AC_LOG2_TABLE_SIZE) in fixed point, interpolated linearly.

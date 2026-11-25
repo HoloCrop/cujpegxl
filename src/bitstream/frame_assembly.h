@@ -38,7 +38,7 @@ std::vector<std::uint8_t> build_dc_global(const QuantParams& qp);
 
 // Builds the byte-aligned AcGlobal section for the coefficient `orders` and the
 // AC context clustering `clustering`, and in `code` the matching code of the AC group token streams
-// (entries cluster << TOKEN_CLUSTER_SHIFT | symbol). The constructor chooses the
+// (entries cluster * TOKEN_ROW_SIZE + symbol). The constructor chooses the
 // entropy mode by libjxl's rule: rANS, except prefix codes when the histograms
 // hold fewer than 100 tokens or each holds a single symbol. build_cluster(c)
 // must then run for every cluster c < num_clusters(), and build_coeff_orders()
