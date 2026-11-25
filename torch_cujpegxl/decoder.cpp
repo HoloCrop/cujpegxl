@@ -21,6 +21,8 @@ void decode_camera_groups(float*, const int32_t*, camera_plan, const camera_bloc
                           cudaStream_t);
 
 namespace {
+struct CameraStreamError : std::runtime_error { using std::runtime_error::runtime_error; };
+
 struct HostPayload {
     at::Tensor values;
     std::exception_ptr error;
@@ -126,7 +128,8 @@ struct Decoder {
                                            HostPayload::allocate, &payload);
             if (payload.error)
                 std::rethrow_exception(payload.error);
-            TORCH_CHECK(size >= 0, "invalid or unsupported camera JPEG XL at batch index ", i);
+            if (size < 0)
+                throw CameraStreamError("invalid or unsupported camera JPEG XL at batch index " + std::to_string(i));
             auto gpu_metadata = metadata.to(device, true);
             auto gpu_values = payload.values.narrow(0, 0, size).to(device, true);
             auto gpu_tables = reinterpret_cast<const camera_tables*>(gpu_metadata.data_ptr());
@@ -205,6 +208,7 @@ static std::vector<std::string_view> byte_views(const std::vector<py::bytes>& im
 }
 
 void register_decoder(py::module_& module) {
+    py::register_exception<CameraStreamError>(module, "CameraStreamError", PyExc_RuntimeError);
     py::class_<PendingDecode>(module, "_PendingDecode")
         .def("result", &PendingDecode::result, py::call_guard<py::gil_scoped_release>())
         .def("on_current_stream", &PendingDecode::on_current_stream, py::call_guard<py::gil_scoped_release>());
