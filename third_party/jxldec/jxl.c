@@ -1005,6 +1005,10 @@ int jxl_hf_pass_read(jxl_ctx *ctx, jxl_br *br, jxl_hf_pass *hp,
 void jxl_hf_pass_free(jxl_ctx *ctx, jxl_hf_pass *hp);
 
 typedef struct {
+#ifdef CUJPEGXL_CAPTURE
+    camera_block *camera_plane[3];
+    uint32_t camera_stride[3];
+#endif
     uint32_t num_hf_presets;
     const jxl_hf_block_ctx *bc;
     jxl_block_info *block_info;
@@ -10363,6 +10367,7 @@ typedef struct {
     jxl_natural_orders no;
 } jxl_vardct_state;
 #ifdef CUJPEGXL_CAPTURE
+static int prepare_camera_payload(jxl_ctx *, const jxl_vardct_state *, uint32_t, int);
 static int CUJPEGXL_CAPTURE(jxl_ctx *, jxl_vardct_state *, const jxl_image_metadata *, const jxl_frame_header *);
 #endif
 
@@ -10407,12 +10412,15 @@ static int vardct_state_alloc(jxl_ctx *ctx, jxl_vardct_state *v, uint32_t bw,
     for (c = 0; c < 3; c++) {
         v->lf[c] = (float *)jxl_calloc(ctx, (size_t)bw * bh, sizeof(float));
         v->lfq[c] = (int32_t *)jxl_calloc(ctx, (size_t)bw * bh, sizeof(int32_t));
+#ifndef CUJPEGXL_CAPTURE
         if (c == 0 && skip_coeff0_zero) {
             v->coeff[c] = (float *)jxl_malloc(ctx, coeff_bytes);
         } else {
             v->coeff[c] = (float *)jxl_calloc(ctx, coeff_count, sizeof(float));
         }
-        if (!v->lf[c] || !v->lfq[c] || !v->coeff[c]) return -1;
+        if (!v->coeff[c]) return -1;
+#endif
+        if (!v->lf[c] || !v->lfq[c]) return -1;
     }
     v->block_info =
         (jxl_block_info *)jxl_calloc(ctx, (size_t)bw * bh, sizeof(jxl_block_info));
@@ -10955,6 +10963,9 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
     {
         uint32_t p, g;
         uint32_t groups_per_row = jxl_frame_groups_per_row(fh);
+#ifdef CUJPEGXL_CAPTURE
+        if (prepare_camera_payload(ctx, &vd, num_groups, sec.single) != 0) goto done;
+#endif
         for (p = 0; p < num_passes; p++) {
             for (g = 0; g < num_groups; g++) {
                 jxl_chanlist *cl = &gl.pass[(size_t)p * num_groups + g];
@@ -10992,8 +11003,15 @@ int jxl_frame_decode(jxl_ctx *ctx, jxl_doc *doc, const jxl_frame_header *fh,
                         lfq_view[c].w = (bwid + ((1u << vd.hs[c]) - 1)) >> vd.hs[c];
                         lfq_view[c].h = (bhig + ((1u << vd.vs[c]) - 1)) >> vd.vs[c];
                         hp.lf_quant[c] = &lfq_view[c];
+#ifdef CUJPEGXL_CAPTURE
+                        hp.camera_stride[c] = vd.bw >> vd.hs[c];
+                        hp.camera_plane[c] = ((camera_output*)ctx->user)->plane[c] +
+                            sby0 * hp.camera_stride[c] + sbx0;
+                        outp[c] = NULL;
+#else
                         outp[c] = vd.coeff[c] + (size_t)(sby0 * 8) * vd.ps +
                                   sbx0 * 8;
+#endif
                         strides[c] = vd.ps;
                     }
                     hp.pass = &vd.passes[p];
@@ -12173,6 +12191,12 @@ void jxl_jpeg_upsampling_shifts(const uint32_t ju[3], int idx, int *hs,
 
 #define JXL_COEFF_ADD(dst, v) ((dst) = (int32_t)((uint32_t)(dst) + (uint32_t)(v)))
 
+#ifdef CUJPEGXL_CAPTURE
+#define JXL_STORE_DCT8_COEFF(k, coeff) store_camera_value(values, &written, &mask, k, coeff)
+#else
+#define JXL_STORE_DCT8_COEFF(k, coeff) JXL_COEFF_ADD(coeff_out[coeff_offsets[k]], coeff)
+#endif
+
 int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                        const jxl_hf_coeff_params *p, float *out[3],
                        size_t stride[3]) {
@@ -12208,6 +12232,25 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
         return -1;
     }
 
+#ifdef CUJPEGXL_CAPTURE
+    camera_output *camera = ctx->user;
+    if (camera->plan->groups) {
+        size_t pos = jxl_br_bits_read(br);
+        if ((pos & 7) || pos/8 > br->len) return -1;
+        size_t size = br->len-pos/8;
+        if (size < 4 || size > UINT32_MAX/8) return -1;
+        uint32_t offset = camera->used*4;
+        size_t reserved = (size+11)&~(size_t)3;
+        if (reserved > camera->capacity-offset) return -1;
+        uint8_t *data=(uint8_t*)camera->values;
+        uint32_t first=p->camera_plane[1]-camera->plane[1];
+        unsigned stride=p->camera_stride[1];
+        ((camera_group*)data)[camera->next_group++]=(camera_group){offset,size,first%stride,first/stride,p->bi_w,p->bi_h};
+        memcpy(data+offset,br->data+pos/8,size);
+        memset(data+offset+size,0,reserved-size);
+        camera->used+=reserved/4;
+    }
+#endif
     jxl_dec_begin(dist, br);
 
     {
@@ -12234,7 +12277,11 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
             int32_t qf;
             int ci, need_transpose;
 
+#ifdef CUJPEGXL_CAPTURE
+            if (bi->dct_select != JXL_TR_DCT8) goto done;
+#else
             if (bi->dct_select >= JXL_TR_COUNT) continue;
+#endif
             qf = bi->hf_mul;
             jxl_tr_select_size(bi->dct_select, &bw8, &bh8);
             num_blocks = bw8 * bh8;
@@ -12277,6 +12324,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                 uint32_t is_prev_nonzero;
                 const uint16_t *ord;
                 const uint32_t *coeff_offsets = NULL;
+                int dct8_output = 0;
                 int32_t *coeff_out = NULL;
                 size_t coeff_stride = 0;
                 uint32_t coeff_ctx_base;
@@ -12295,6 +12343,12 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                     goto done;
                 }
                 block_ctx = bc->block_ctx_map[idx];
+#ifdef CUJPEGXL_CAPTURE
+                if (camera->plan->groups) {
+                    p->camera_plane[cc][sy*p->camera_stride[cc]+sx].entry=block_ctx;
+                    continue;
+                }
+#endif
 
                 if (sy == 0) {
                     predicted = (sx == 0) ? 32 : nz_row[cc][sx - 1];
@@ -12322,11 +12376,25 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                 for (dx8 = 0; dx8 < bw8 && sx + dx8 < nz_len[cc]; dx8++) {
                     nz_row[cc][sx + dx8] = non_zeros_val;
                 }
+#ifdef CUJPEGXL_CAPTURE
+
+                camera_block *block = p->camera_plane[cc] + sy*p->camera_stride[cc] + sx;
+                uint64_t mask = 0;
+                uint32_t written = 0;
+                block->entry = camera->used;
+                uint32_t *mask_words = (uint32_t *)camera->values + 2*(block - camera->plane[0]);
+                mask_words[0] = mask_words[1] = 0;
+                camera->used += non_zeros;
+                int32_t *values = camera->values + block->entry;
+#endif
                 if (non_zeros == 0) continue;
                 bi->hf_nonzero_mask |= (uint8_t)(1u << cc);
 
                 is_prev_nonzero = (non_zeros <= num_blocks * 4) ? 1 : 0;
                 ord = NULL;
+#ifdef CUJPEGXL_CAPTURE
+                dct8_output = 1;
+#else
                 if (!(p->discard_mask & (1u << cc))) {
                     ord = p->pass->order[order_id][cc];
                     if (!ord) ord = jxl_natural_order(ctx, p->no, (int)order_id);
@@ -12351,11 +12419,13 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                             order0_ready[cc] = 1;
                         }
                         coeff_offsets = order0_offsets[cc];
+                        dct8_output = 1;
                     }
                 }
 
+#endif
                 coeff_ctx_base = block_ctx * 458 + 37 * bc->num_block_clusters;
-                if (coeff_offsets && p->coeff_shift == 0 &&
+                if (dct8_output && p->coeff_shift == 0 &&
                     !dist->lz77_enabled && !dist->use_prefix) {
 
                     jxl_br lbr = *br;
@@ -12385,7 +12455,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                         }
                         coeff = (int32_t)((ucoeff >> 1) ^
                                           (((~ucoeff) & 1u) - 1u));
-                        JXL_COEFF_ADD(coeff_out[coeff_offsets[k]], coeff);
+                        JXL_STORE_DCT8_COEFF(k, coeff);
                         is_prev_nonzero = ucoeff != 0;
                         non_zeros -= is_prev_nonzero;
                         if (non_zeros == 0) break;
@@ -12396,7 +12466,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                         JXL_ERR(ctx, "vardct: too many zeros in varblock");
                         goto done;
                     }
-                } else if (coeff_offsets && p->coeff_shift == 0 &&
+                } else if (dct8_output && p->coeff_shift == 0 &&
                            !dist->lz77_enabled) {
                     for (k = 1; k < 64; k++) {
                         uint32_t nzi = non_zeros - 1;
@@ -12418,12 +12488,12 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
 
                         coeff = (int32_t)((ucoeff >> 1) ^
                                           (((~ucoeff) & 1u) - 1u));
-                        JXL_COEFF_ADD(coeff_out[coeff_offsets[k]], coeff);
+                        JXL_STORE_DCT8_COEFF(k, coeff);
                         is_prev_nonzero = ucoeff != 0;
                         non_zeros -= is_prev_nonzero;
                         if (non_zeros == 0) break;
                     }
-                } else if (coeff_offsets) {
+                } else if (dct8_output) {
                     for (k = 1; k < 64; k++) {
                         uint32_t nzi = non_zeros - 1;
                         uint32_t fi = k - 1;
@@ -12448,7 +12518,7 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                         }
                         coeff = (int32_t)((uint32_t)jxl_unpack_signed(ucoeff)
                                           << p->coeff_shift);
-                        JXL_COEFF_ADD(coeff_out[coeff_offsets[k]], coeff);
+                        JXL_STORE_DCT8_COEFF(k, coeff);
                         is_prev_nonzero = 1;
                         non_zeros--;
                         if (non_zeros == 0) break;
@@ -12542,6 +12612,10 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
                     }
                 }
 
+#ifdef CUJPEGXL_CAPTURE
+                mask_words[0] = (uint32_t)mask;
+                mask_words[1] = (uint32_t)(mask >> 32);
+#endif
                 if (non_zeros != 0) {
                     JXL_ERR(ctx, "vardct: non-zero count exceeds the block");
                     goto done;
@@ -12554,6 +12628,9 @@ int jxl_write_hf_coeff(jxl_ctx *ctx, jxl_br *br,
         }
     }
 
+#ifdef CUJPEGXL_CAPTURE
+    if (camera->plan->groups) { rc=0; goto done; }
+#endif
     if (jxl_dec_finalize(dist) != 0) {
         JXL_ERR(ctx, "vardct: bad HF coefficient ANS state");
         goto done;

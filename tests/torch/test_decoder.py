@@ -23,3 +23,16 @@ def test_decode_remap_on_current_stream():
         torch.testing.assert_close(views[1, 0, 1], rgb[1, 15, 12])
         with pytest.raises(RuntimeError, match='batch index 1'):
             decoder.decode_batch([files[0], files[1][:-100]])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA camera decoder')
+def test_corrupt_entropy_group_reports_batch_index_and_preserves_next_call():
+    width, height = 513, 259
+    image = torch.randint(256, (height, width, 3), device='cuda', dtype=torch.uint8)
+    file = Encoder(width, height, 0.36).encode(image)
+    decoder = Decoder(width, height)
+    expected = decoder.decode(file)
+    damaged = file[:-64] + bytes(64)
+    with pytest.raises(RuntimeError, match='batch index 1'):
+        decoder.decode_batch([file, damaged, file])
+    torch.testing.assert_close(decoder.decode(file), expected)

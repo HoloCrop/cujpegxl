@@ -2,3 +2,4 @@ recursive-include include *.h
 recursive-include src *.h *.cuh *.cc *.cu
 include src/camera_coefficients.c
 recursive-include third_party/jxldec *.c *.h *.md
+include torch_cujpegxl/camera_ans.cuh
