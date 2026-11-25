@@ -308,10 +308,12 @@ TEST(CujpegxlEncodeGpu, WaitsForInputStream) {
                            actual.begin()));
 }
 
+enum class InputLayout { NV12, PITCHED_NV12, PITCHED_RGB8 };
+
 struct EncodeCase {
     std::uint32_t width;
     std::uint32_t height;
-    bool pitched;
+    InputLayout layout;
 };
 
 class EncodesAnySize : public testing::TestWithParam<EncodeCase> {};
@@ -324,18 +326,29 @@ TEST_P(EncodesAnySize, DecodesCloseToSource) {
     const EncodeCase& c{GetParam()};
     const cujpegxl_config config{c.width, c.height, 1.0f};
     const HostNv12 image{gradient_nv12(c.width, c.height)};
-    DeviceNv12 nv12{};
-    ASSERT_TRUE(upload_nv12(image, nv12, c.pitched));
-
+    const std::vector<std::uint8_t> expected{nv12_to_rgb(image)};
+    DeviceNv12 storage{};
     std::size_t bound{0};
     ASSERT_EQ(cujpegxl_max_output_size(&config, &bound), CUJPEGXL_OK);
     std::vector<std::uint8_t> buffer(bound, 0);
     cujpegxl_output output{buffer.data(), 0, buffer.size()};
     cujpegxl_encoder* encoder{nullptr};
     ASSERT_EQ(cujpegxl_encoder_create(&config, 0, 1, &encoder), CUJPEGXL_OK);
-    const cujpegxl_nv12_input input{nv12.luma, nv12.chroma, nv12.luma_pitch, nv12.chroma_pitch,
-                                    nullptr};
-    ASSERT_EQ(cujpegxl_encoder_submit(encoder, &input, &output), CUJPEGXL_OK);
+    if (c.layout == InputLayout::PITCHED_RGB8) {
+        const std::size_t row_bytes{3 * c.width};
+        ASSERT_EQ(cudaMallocPitch(&storage.luma, &storage.luma_pitch, row_bytes, c.height),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpy2D(storage.luma, storage.luma_pitch, expected.data(), row_bytes,
+                               row_bytes, c.height, cudaMemcpyHostToDevice),
+                  cudaSuccess);
+        const cujpegxl_rgb8_input input{storage.luma, storage.luma_pitch, nullptr};
+        ASSERT_EQ(cujpegxl_encoder_submit_rgb8(encoder, &input, &output), CUJPEGXL_OK);
+    } else {
+        ASSERT_TRUE(upload_nv12(image, storage, c.layout == InputLayout::PITCHED_NV12));
+        const cujpegxl_nv12_input input{storage.luma, storage.chroma, storage.luma_pitch,
+                                        storage.chroma_pitch, nullptr};
+        ASSERT_EQ(cujpegxl_encoder_submit(encoder, &input, &output), CUJPEGXL_OK);
+    }
     cujpegxl_output* received{nullptr};
     ASSERT_EQ(cujpegxl_encoder_receive(encoder, &received), CUJPEGXL_OK);
     cujpegxl_encoder_destroy(encoder);
@@ -344,7 +357,6 @@ TEST_P(EncodesAnySize, DecodesCloseToSource) {
     ASSERT_TRUE(decode(output.data, output.size, decoded));
     ASSERT_EQ(decoded.xs, config.width);
     ASSERT_EQ(decoded.ys, config.height);
-    const std::vector<std::uint8_t> expected{nv12_to_rgb(image)};
     ASSERT_EQ(decoded.rgb.size(), expected.size());
     int max_error{0};
     std::size_t worst{0};
@@ -363,11 +375,16 @@ TEST_P(EncodesAnySize, DecodesCloseToSource) {
 // and columns, across an AC group (256px) and a DC group (2048px) edge, with
 // tight odd chroma rows and padded ones.
 INSTANTIATE_TEST_SUITE_P(Sizes, EncodesAnySize,
-                         testing::Values(EncodeCase{264, 264, false}, EncodeCase{257, 1, false},
-                                         EncodeCase{1, 257, false}, EncodeCase{257, 257, true},
-                                         EncodeCase{643, 389, false}, EncodeCase{643, 389, true},
-                                         EncodeCase{1366, 766, false}, EncodeCase{1923, 1081, true},
-                                         EncodeCase{2049, 300, false}));
+                         testing::Values(EncodeCase{264, 264, InputLayout::NV12},
+                                         EncodeCase{257, 1, InputLayout::NV12},
+                                         EncodeCase{1, 257, InputLayout::NV12},
+                                         EncodeCase{257, 257, InputLayout::PITCHED_NV12},
+                                         EncodeCase{643, 389, InputLayout::NV12},
+                                         EncodeCase{643, 389, InputLayout::PITCHED_NV12},
+                                         EncodeCase{1366, 766, InputLayout::NV12},
+                                         EncodeCase{1923, 1081, InputLayout::PITCHED_NV12},
+                                         EncodeCase{2049, 300, InputLayout::NV12},
+                                         EncodeCase{321, 259, InputLayout::PITCHED_RGB8}));
 
 class RejectsResolution : public testing::TestWithParam<std::pair<std::uint32_t, std::uint32_t>> {};
 

@@ -904,12 +904,19 @@ __global__ void __launch_bounds__(FIELD_THREADS)
     }
 }
 
+struct Nv12View {
+    cudaTextureObject_t luma, chroma;
+};
+struct Rgb8View {
+    const std::uint8_t* pixels;
+    std::size_t pitch;
+};
+template <typename View>
 __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPILED_ARCH])
-    frontend_fused_kernel(cudaTextureObject_t luma_tex, cudaTextureObject_t chroma_tex,
-                          std::size_t width, std::size_t height, std::size_t bw, std::size_t bh,
-                          float km0, float km1, float km2, float km3, float mul_pb, float add_pb,
-                          float qgsf, __half* __restrict__ coeffs, std::int8_t* __restrict__ acs,
-                          float* __restrict__ adaptive_field,
+    frontend_fused_kernel(View image, std::size_t width, std::size_t height, std::size_t bw,
+                          std::size_t bh, float km0, float km1, float km2, float km3, float mul_pb,
+                          float add_pb, float qgsf, __half* __restrict__ coeffs,
+                          std::int8_t* __restrict__ acs, float* __restrict__ adaptive_field,
                           std::uint32_t* __restrict__ field_histogram) {
     extern __shared__ __align__(16) unsigned char workspace_bytes[];
     float* workspace{reinterpret_cast<float*>(workspace_bytes)};
@@ -951,15 +958,23 @@ __global__ void __launch_bounds__(FRONTEND_THREADS, FRONTEND_BLOCKS_PER_SM[COMPI
         if (i >= PAD_SAMPLES) {
             break;
         }
-        // Point sampling at an integral coordinate reads that texel.
-        const float yv{tex2D<float>(luma_tex, gx, gy)};
-        // The pixel centre in chroma texels, (g + 0.5) / 2 in one rounding.
-        const float2 c{tex2D<float2>(chroma_tex, fminf(fmaf(gx, 0.5f, 0.25f), chroma_x_max),
-                                     fminf(fmaf(gy, 0.5f, 0.25f), chroma_y_max))};
-        float xo{};
-        float yo{};
-        float bo{};
-        nv12_pixel_to_xyb(yv, c.x, c.y, xo, yo, bo);
+        float xo{}, yo{}, bo{};
+        if constexpr (std::is_same_v<View, Rgb8View>) {
+            const int x{min(max(static_cast<int>(gx), 0), static_cast<int>(width) - 1)};
+            const int y{min(max(static_cast<int>(gy), 0), static_cast<int>(height) - 1)};
+            const auto* row{image.pixels + static_cast<std::size_t>(y) * image.pitch};
+            const uchar3 pixel{reinterpret_cast<const uchar3*>(row)[x]};
+            constexpr float unit = 1.f / 255.f;
+            linear_rgb_to_xyb(srgb_to_linear(pixel.x * unit), srgb_to_linear(pixel.y * unit),
+                              srgb_to_linear(pixel.z * unit), xo, yo, bo);
+        } else {
+            // Point sampling at an integral coordinate reads that texel.
+            const float yv{tex2D<float>(image.luma, gx, gy)};
+            // The pixel centre in chroma texels, (g + 0.5) / 2 in one rounding.
+            const float2 c{tex2D<float2>(image.chroma, fminf(fmaf(gx, 0.5f, 0.25f), chroma_x_max),
+                                         fminf(fmaf(gy, 0.5f, 0.25f), chroma_y_max))};
+            nv12_pixel_to_xyb(yv, c.x, c.y, xo, yo, bo);
+        }
         sh_y[i] = yo;
         if constexpr (HALF2_FRONTEND) {
             raw_xb[i] = __floats2half2_rn(xo, bo);
@@ -1204,10 +1219,10 @@ Nv12Textures::~Nv12Textures() {
     }
 }
 
-bool encode_frontend(const Nv12Textures& image, std::size_t width, std::size_t height,
-                     float distance, __half* coeffs, std::int8_t* acs, float* adaptive_field,
-                     std::uint32_t* field_histogram, std::int32_t* quant_field,
-                     QuantCalibration* calibration, cudaStream_t stream) {
+template <typename View>
+bool encode_view(View image, std::size_t width, std::size_t height, float distance, __half* coeffs,
+                 std::int8_t* acs, float* adaptive_field, std::uint32_t* field_histogram,
+                 std::int32_t* quant_field, QuantCalibration* calibration, cudaStream_t stream) {
     const std::size_t bw{padded_to_blocks(width) / 8};
     const std::size_t bh{padded_to_blocks(height) / 8};
     const std::uint32_t blocks{static_cast<std::uint32_t>(bw * bh)};
@@ -1244,10 +1259,6 @@ bool encode_frontend(const Nv12Textures& image, std::size_t width, std::size_t h
     km2 *= norm;
     km3 *= norm;
 
-    if (!image.valid()) {
-        return false;
-    }
-
     if (cudaMemsetAsync(field_histogram, 0, ADAPTIVE_FIELD_BINS * sizeof(std::uint32_t), stream) !=
         cudaSuccess) {
         return false;
@@ -1256,8 +1267,8 @@ bool encode_frontend(const Nv12Textures& image, std::size_t width, std::size_t h
     const dim3 grid{static_cast<unsigned int>((bw + TB - 1) / TB),
                     static_cast<unsigned int>((bh + TB - 1) / TB)};
     frontend_fused_kernel<<<grid, block, WORKSPACE_BYTES, stream>>>(
-        image.luma(), image.chroma(), width, height, bw, bh, km0, km1, km2, km3, mul_pb, add_pb,
-        qgsf, coeffs, acs, adaptive_field, field_histogram);
+        image, width, height, bw, bh, km0, km1, km2, km3, mul_pb, add_pb, qgsf, coeffs, acs,
+        adaptive_field, field_histogram);
     calibrate_field_kernel<<<1, CALIBRATE_THREADS, 0, stream>>>(field_histogram, quant_dc_float,
                                                                 calibration);
     quantize_field_kernel<<<(blocks + FIELD_THREADS - 1) / FIELD_THREADS, FIELD_THREADS, 0,
@@ -1265,4 +1276,20 @@ bool encode_frontend(const Nv12Textures& image, std::size_t width, std::size_t h
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool encode_frontend(const Nv12Textures& image, std::size_t width, std::size_t height,
+                     float distance, __half* coeffs, std::int8_t* acs, float* adaptive_field,
+                     std::uint32_t* field_histogram, std::int32_t* quant_field,
+                     QuantCalibration* calibration, cudaStream_t stream) {
+    return image.valid() &&
+           encode_view(Nv12View{image.luma(), image.chroma()}, width, height, distance, coeffs, acs,
+                       adaptive_field, field_histogram, quant_field, calibration, stream);
+}
+bool encode_rgb_frontend(const std::uint8_t* rgb, std::size_t pitch, std::size_t width,
+                         std::size_t height, float distance, __half* coeffs, std::int8_t* acs,
+                         float* adaptive_field, std::uint32_t* field_histogram,
+                         std::int32_t* quant_field, QuantCalibration* calibration,
+                         cudaStream_t stream) {
+    return encode_view(Rgb8View{rgb, pitch}, width, height, distance, coeffs, acs, adaptive_field,
+                       field_histogram, quant_field, calibration, stream);
+}
 }  // namespace cujpegxl

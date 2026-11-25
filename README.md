@@ -20,6 +20,8 @@ The project is still in an early development stage, and further iterations are r
 
 ## Usage
 
+The C API accepts pitched CUDA device buffers in NV12 or packed 8-bit sRGB. For interleaved RGB, pass a `cujpegxl_rgb8_input` to `cujpegxl_encoder_submit_rgb8`. The pitch is in bytes. Both input formats use the same distance setting, transform selection and entropy coder.
+
 See examples for usage in Bazel ([examples/bazel_consumer](https://github.com/m-pilia/cujpegxl/tree/master/examples/bazel_consumer)) and CMake ([examples/cmake_consumer](https://github.com/m-pilia/cujpegxl/tree/master/examples/cmake_consumer)) projects.
 
 Python bindings are provided in [//python:pycujpegxl](https://github.com/m-pilia/cujpegxl/blob/master/python/BUILD.bazel). Currently they take host buffers as input and are meant primarily for evaluation, not for high-performance applications.
@@ -63,7 +65,7 @@ Some features are not implemented:
 - Single-group frames (or, in general, inputs 256x256 or smaller).
 - Multi-pass encoding.
 - Reference frames.
-- Input pixel formats other than YUV420 NV12.
+- Input pixel formats other than YUV420 NV12 and packed RGB8.
 - ICC colour profiles.
 
 ## Evaluation tools
