@@ -44,7 +44,7 @@ void write_codestream_headers(BitWriter& w, std::uint32_t xsize, std::uint32_t y
     write_bool(w,false); // no extra fields
     write_bool(w,false); // integer samples
     write_bits(w,2,0);   // eight bits per sample
-    write_bool(w,true);  // 16-bit modular buffers suffice
+    write_bool(w, false);  // Raw quantization tables require 32-bit modular buffers.
     write_bits(w,2,0);   // no extra channels
     write_bool(w,false); // no XYB transform
     write_bool(w,true);  // sRGB
