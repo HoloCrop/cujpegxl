@@ -172,3 +172,29 @@ The cujpegxl software is made available under a [BSD-3-Clause license](https://r
 This software is a [derivative work](https://en.wikipedia.org/wiki/Derivative_work) of [libjxl](https://github.com/libjxl/libjxl), the reference JPEG XL implementation, which is made available by its authors [under the same license type](https://github.com/libjxl/libjxl/blob/bdde644b94c125a15e532b2572b96306371a7d4e/LICENSE).
 
 For additional patent rights, see the [PATENTS file in the libjxl source codebase](https://raw.githubusercontent.com/libjxl/libjxl/bdde644b94c125a15e532b2572b96306371a7d4e/PATENTS).
+
+### Asynchronous Torch camera batches
+
+Use one context-managed codec per image geometry and device. Submit on the CUDA
+stream that produced the inputs. Keep input pixels and remap coordinates
+unmodified until completion. Each submission returns a concurrent future.
+Encoding returns camera files in input order. Decoding returns validated CUDA
+pixels and registers them on the stream calling `result()`.
+
+```python
+with AsyncEncoder(width, height, distance=0.36) as encoder:
+    first = encoder.encode_batch_async(first_camera_set)
+    second = encoder.encode_batch_async(second_camera_set)
+    write_files(first.result())
+    write_files(second.result())
+
+with AsyncDecoder(width, height) as decoder:
+    pixels = decoder.decode_batch_async(camera_files, maps)
+    load_next_frame()
+    consume(pixels.result())
+```
+
+Import both classes from `torch_cujpegxl`. Two outstanding batches are allowed
+by default. At capacity, submission waits for a slot. Closing drains accepted
+work. Retrieve each future to observe codec errors. A failed encoder must be
+recreated. The decoder can continue after a corrupt batch.

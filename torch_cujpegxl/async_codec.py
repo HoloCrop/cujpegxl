@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
-from threading import Condition, Lock, Semaphore, Thread
+from threading import Condition, Lock, Semaphore
 
 import torch
 
@@ -35,8 +35,8 @@ class AsyncEncoder(AbstractContextManager):
         self.closed = False
         self.condition = Condition()
         self.queue: deque[EncodeBatch] = deque()
-        self.worker = Thread(target=self._run, name="jxl-encode")
-        self.worker.start()
+        self.worker = ThreadPoolExecutor(1, thread_name_prefix="jxl-encode")
+        self.running = False
 
     def encode_batch_async(self, images: Sequence[torch.Tensor]) -> Future[list[bytes]]:
         """Submit on the caller's current CUDA stream. Blocks only for queue capacity."""
@@ -53,7 +53,9 @@ class AsyncEncoder(AbstractContextManager):
             ready = torch.cuda.current_stream(self.device).record_event()
             self.queue.append(EncodeBatch(images, ready, future, len(images)))
             self.active += 1
-            self.condition.notify_all()
+            if not self.running:
+                self.running = True
+                self.worker.submit(self._run)
         return future
 
     def _run(self):
@@ -62,9 +64,9 @@ class AsyncEncoder(AbstractContextManager):
             with torch.cuda.stream(self.stream):
                 while True:
                     with self.condition:
-                        self.condition.wait_for(lambda: self.closed or self.queue or pending)
                         batch = self.queue.popleft() if self.queue else None
                         if batch is None and not pending:
+                            self.running = False
                             return
                     if batch is not None:
                         pending.append(batch)
@@ -95,10 +97,19 @@ class AsyncEncoder(AbstractContextManager):
         with self.condition:
             self.closed = True
             self.condition.notify_all()
-        self.worker.join()
+        self.worker.shutdown()
 
     def __exit__(self, *exc):
         self.close()
+
+
+class DecodedBatch(Future[torch.Tensor]):
+    """Keep the allocator aware of the stream on which the caller receives the pixels."""
+
+    def result(self, timeout: float | None = None) -> torch.Tensor:
+        pixels = super().result(timeout)
+        pixels.record_stream(torch.cuda.current_stream(pixels.device))
+        return pixels
 
 
 class AsyncDecoder(AbstractContextManager):
@@ -123,7 +134,7 @@ class AsyncDecoder(AbstractContextManager):
 
         def enqueue():
             with torch.cuda.stream(self.stream):
-                if maps is not None:
+                if maps is not None and ready is not None:
                     self.stream.wait_event(ready)
                     maps.record_stream(self.stream)
                 return self.decoder._enqueue(files, maps)
@@ -134,7 +145,7 @@ class AsyncDecoder(AbstractContextManager):
                 self.slots.release()
                 raise RuntimeError("decoder is closed")
             submitted = self.submitter.submit(enqueue)
-            result: Future[torch.Tensor] = Future()
+            result = DecodedBatch()
             result.set_running_or_notify_cancel()
 
             def finish():
