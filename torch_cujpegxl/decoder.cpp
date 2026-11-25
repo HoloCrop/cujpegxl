@@ -36,6 +36,20 @@ struct HostPayload {
         }
     }
 };
+struct PendingDecode {
+    at::Tensor pixels;
+    std::vector<at::Tensor> status;
+    at::cuda::CUDAEvent ready;
+
+    at::Tensor result() const {
+        ready.synchronize();
+        for (size_t i = 0; i < status.size(); ++i)
+            if (status[i].defined())
+                TORCH_CHECK(*status[i].data_ptr<int>() == 0, "invalid camera AC group at batch index ", i);
+        return pixels;
+    }
+};
+
 struct Decoder {
     int width, height;
     c10::Device device;
@@ -45,7 +59,7 @@ struct Decoder {
     }
 
     at::Tensor batch(std::span<const std::string_view> files,
-                     std::optional<at::Tensor> maps) const {
+                     std::optional<at::Tensor> maps, PendingDecode* pending = nullptr) const {
         c10::cuda::CUDAGuard guard(device);
         TORCH_CHECK(files.size() > 0 && files.size() <= 65535, "expected 1 to 65535 files");
         int ow = width, oh = height;
@@ -69,6 +83,7 @@ struct Decoder {
         auto pinned = at::TensorOptions().dtype(at::kByte).pinned_memory(true);
         auto out =
             at::empty({batch_size, oh, ow, 3}, at::TensorOptions().device(device).dtype(at::kByte));
+        if (pending) pending->status.resize(batch_size);
         auto caller = c10::cuda::getCurrentCUDAStream();
         at::cuda::CUDAEvent ready;
         std::vector<at::cuda::CUDAEvent> finished(batch_size);
@@ -113,13 +128,15 @@ struct Decoder {
                 decode_camera_groups(blocks.data_ptr<float>(), gpu_values.data_ptr<int32_t>(), plan,
                                      gpu_headers, status.data_ptr<int>(), count, width, stream);
                 host_status.copy_(status, true);
-                checked.record(stream);
+                if (!pending) checked.record(stream);
             }
             render_camera(
                 blocks.data_ptr<float>(), gpu_headers, gpu_tables, gpu_values.data_ptr<int32_t>(),
                 plan.groups != 0, maps ? maps->data_ptr<float>() + i * stride * 2 : nullptr,
                 out.data_ptr<uint8_t>() + i * ow * oh * 3, count, width, height, ow, oh, stream);
-            if (plan.groups) {
+            if (plan.groups && pending) {
+                pending->status[i] = std::move(host_status);
+            } else if (plan.groups) {
                 checked.synchronize();
                 TORCH_CHECK(*host_status.data_ptr<int>() == 0,
                             "invalid camera AC group at batch index ", i);
@@ -149,6 +166,7 @@ struct Decoder {
                 if (error)
                     std::rethrow_exception(error);
         }
+        if (pending) pending->ready.record(caller);
         return out;
     }
 };
@@ -161,7 +179,16 @@ static std::string_view view_bytes(const py::bytes& bytes) {
     return {data, static_cast<size_t>(size)};
 }
 
+static std::vector<std::string_view> byte_views(const std::vector<py::bytes>& images) {
+    std::vector<std::string_view> files;
+    files.reserve(images.size());
+    for (const auto& image : images) files.emplace_back(view_bytes(image));
+    return files;
+}
+
 void register_decoder(py::module_& module) {
+    py::class_<PendingDecode>(module, "_PendingDecode")
+        .def("result", &PendingDecode::result, py::call_guard<py::gil_scoped_release>());
     py::class_<Decoder>(module, "Decoder")
         .def(py::init<int, int, c10::DeviceIndex>(), py::arg("width"), py::arg("height"),
              py::arg("device_index") = 0)
@@ -177,12 +204,17 @@ void register_decoder(py::module_& module) {
             "decode_batch",
             [](const Decoder& decoder, const std::vector<py::bytes>& images,
                std::optional<at::Tensor> maps) {
-                std::vector<std::string_view> files;
-                files.reserve(images.size());
-                for (const auto& image : images)
-                    files.emplace_back(view_bytes(image));
+                auto files = byte_views(images);
                 py::gil_scoped_release release;
                 return decoder.batch(files, maps);
             },
-            py::arg("images"), py::arg("maps") = py::none());
+            py::arg("images"), py::arg("maps") = py::none())
+        .def("_enqueue", [](const Decoder& decoder, const std::vector<py::bytes>& images,
+                            std::optional<at::Tensor> maps) {
+            auto files = byte_views(images);
+            py::gil_scoped_release release;
+            auto pending = std::make_unique<PendingDecode>();
+            pending->pixels = decoder.batch(files, maps, pending.get());
+            return pending;
+        }, py::arg("images"), py::arg("maps") = py::none());
 }

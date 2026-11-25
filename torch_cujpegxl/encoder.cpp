@@ -75,6 +75,13 @@ public:
         return enqueue(images);
     }
 
+    py::bytes receive_one() {
+        auto lock = acquire();
+        c10::cuda::CUDAGuard guard(device_);
+        TORCH_CHECK(handle_ && pending_, "no pending encode");
+        return receive();
+    }
+
     py::list flush() {
         auto lock = acquire();
         c10::cuda::CUDAGuard guard(device_);
@@ -176,5 +183,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module, py::mod_gil_not_used()) {
             return self.encode_batch(batch.unbind(0));
         }, py::arg("images"))
         .def("push", &Encoder::push, py::arg("images"))
+        .def("_receive", &Encoder::receive_one)
         .def("flush", &Encoder::flush);
 }
