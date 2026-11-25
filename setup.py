@@ -15,8 +15,9 @@ sources = [
 extension = CUDAExtension(
     'torch_cujpegxl._native',
     sources,
+    extra_link_args=['-fopenmp'],
     include_dirs=[str(root), str(root / 'include')],
-    extra_compile_args={'cxx': ['-O3', '-g0'], 'nvcc': ['-O3', '--extended-lambda', '--expt-relaxed-constexpr']},
+    extra_compile_args={'cxx': ['-O3', '-g0', '-fopenmp'], 'nvcc': ['-O3', '--extended-lambda', '--expt-relaxed-constexpr']},
 )
 class CameraBuild(BuildExtension):
     def build_extensions(self):

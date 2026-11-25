@@ -33,6 +33,30 @@ files = encoder.encode_batch(images)  # NHWC tensor or sequence of HWC tensors
 
 For continuous capture, keep the encoder alive and call `push(camera_images)` for each frame. Consume the returned files in submission order and call `flush()` once at the end to receive the tail. Keep submitted pixels unchanged until their file is returned. A flush retains the encoder's scan history.
 
+### Torch camera decoder
+
+`Decoder(width, height, device_index=0)` accepts independent RGB8 sRGB files
+from the HoloCrop 4:2:2 DCT8 camera encoder. CPU workers entropy-decode and
+dequantize the coefficients. CUDA performs the inverse DCT, chroma upsampling,
+RGB conversion and optional calibrated remap on the current Torch stream.
+
+```python
+from torch_cujpegxl import Decoder
+
+decoder = Decoder(width, height)
+rgb = decoder.decode(file)                     # CUDA uint8 [height, width, 3]
+training = decoder.decode_batch(files, maps)   # CUDA uint8 [batch, out_h, out_w, 3]
+```
+
+The optional contiguous CUDA float32 map stores source pixel coordinates
+`(x, y)` at each output pixel, with integer coordinates at pixel centres.
+Pass one `[out_h, out_w, 2]` map for a shared camera calibration or
+`[batch, out_h, out_w, 2]` for individual calibrations. Remapping uses
+OpenCV-style bilinear interpolation and a constant black border. Batch size
+controls the pinned coefficient storage and GPU working set (about eight
+bytes per source pixel per image in each). CPU parallelism follows Torch's
+intra-op thread setting.
+
 ## Goals
 
 * Conformance. The encoded image must be readable by any standard-conforming decoder.
