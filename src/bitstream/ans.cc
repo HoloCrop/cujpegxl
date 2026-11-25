@@ -133,35 +133,32 @@ struct Normalized {
     std::array<std::int32_t, MAX_SYMBOLS_FOR_SMALL_CODE> symbols{};
 };
 
-bool normalize_counts(Counts& counts, std::int32_t length, std::uint32_t shift, Normalized& out) {
+struct HistogramTargets {
+    Normalized norm{};
+    std::int32_t length{0};
+    std::array<float, ANS_MAX_ALPHABET_SIZE> values{};
+};
+
+HistogramTargets prepare_targets(const std::uint32_t* histogram, std::int32_t length) {
+    HistogramTargets targets{};
     std::uint64_t total{0};
-    std::int32_t max_symbol{0};
-    std::int32_t symbol_count{0};
     for (std::int32_t n{0}; n < length; ++n) {
-        total += static_cast<std::uint64_t>(counts[n]);
-        if (counts[n] > 0) {
-            if (symbol_count < MAX_SYMBOLS_FOR_SMALL_CODE) {
-                out.symbols[symbol_count] = n;
+        total += histogram[n];
+        if (histogram[n] > 0) {
+            if (targets.norm.num_symbols < MAX_SYMBOLS_FOR_SMALL_CODE) {
+                targets.norm.symbols[targets.norm.num_symbols] = n;
             }
-            ++symbol_count;
-            max_symbol = n + 1;
+            ++targets.norm.num_symbols;
+            targets.length = n + 1;
         }
     }
-    out.num_symbols = symbol_count;
-    if (symbol_count == 0) {
-        return true;
+    if (targets.norm.num_symbols >= 2) {
+        const float scale{static_cast<float>(TABLE_SIZE) / static_cast<float>(total)};
+        for (std::int32_t n{0}; n < targets.length; ++n) {
+            targets.values[n] = scale * static_cast<float>(histogram[n]);
+        }
     }
-    if (symbol_count == 1) {
-        counts[out.symbols[0]] = TABLE_SIZE;
-        return true;
-    }
-    const float norm{1.f * static_cast<float>(TABLE_SIZE) / static_cast<float>(total)};
-    std::array<float, ANS_MAX_ALPHABET_SIZE> targets{};
-    for (std::int32_t n{0}; n < max_symbol; ++n) {
-        targets[n] = norm * static_cast<float>(counts[n]);
-    }
-    return rebalance_histogram<false>(targets.data(), max_symbol, shift, out.omit_pos, counts) ||
-           rebalance_histogram<true>(targets.data(), max_symbol, shift, out.omit_pos, counts);
+    return targets;
 }
 
 template <typename W>
@@ -309,36 +306,34 @@ float estimate_data_bits_flat(const std::uint32_t* histogram, std::int32_t lengt
 
 // Method 0 is the flat histogram, method m > 0 the counts at shift m - 1. A
 // shift whose normalization fails is skipped (libjxl aborts the encode).
-float histogram_and_data_cost(const std::uint32_t* histogram, std::int32_t alphabet_size,
-                              std::uint32_t method) {
-    if (method == 0) {
-        return static_cast<float>(ANS_LOG_TAB_SIZE + 2) +
-               estimate_data_bits_flat(histogram, alphabet_size);
-    }
-    const std::uint32_t shift{method - 1};
-    Counts counts{};
-    for (std::int32_t i{0}; i < alphabet_size; ++i) {
-        counts[i] = static_cast<std::int32_t>(histogram[i]);
-    }
-    Normalized norm{};
-    if (!normalize_counts(counts, alphabet_size, shift, norm)) {
-        return std::numeric_limits<float>::max();
-    }
-    CountingBitWriter size{};
-    encode_counts(counts, alphabet_size, norm, shift, size);
-    return static_cast<float>(size.bits_written()) +
-           estimate_data_bits(histogram, counts, alphabet_size);
-}
-
-// kApproximate: the flat histogram and every other shift.
-std::uint32_t best_method(const std::uint32_t* histogram, std::int32_t alphabet_size) {
+std::uint32_t best_method(const std::uint32_t* histogram, std::int32_t length,
+                          Counts& winner, Normalized& winner_norm) {
+    const auto targets{prepare_targets(histogram, length)};
     std::uint32_t method{0};
-    float best_cost{histogram_and_data_cost(histogram, alphabet_size, 0)};
+    float best_cost{static_cast<float>(ANS_LOG_TAB_SIZE + 2) +
+                    estimate_data_bits_flat(histogram, length)};
+    Counts counts{};
+    Normalized norm{targets.norm};
     for (std::uint32_t shift{0}; shift <= ANS_LOG_TAB_SIZE; shift += 2) {
-        const float cost{histogram_and_data_cost(histogram, alphabet_size, shift + 1)};
+        if (norm.num_symbols == 1) {
+            counts[norm.symbols[0]] = TABLE_SIZE;
+        } else if (norm.num_symbols > 1 &&
+                   !rebalance_histogram<false>(targets.values.data(), targets.length, shift, norm.omit_pos, counts) &&
+                   !rebalance_histogram<true>(targets.values.data(), targets.length, shift, norm.omit_pos, counts)) {
+            continue;
+        }
+        CountingBitWriter size{};
+        encode_counts(counts, length, norm, shift, size);
+        const float cost{static_cast<float>(size.bits_written()) +
+                         estimate_data_bits(histogram, counts, length)};
         if (cost < best_cost) {
             method = shift + 1;
             best_cost = cost;
+            std::copy_n(counts.begin(), length, winner.begin());
+            winner_norm = norm;
+        }
+        if (norm.num_symbols < 2) {
+            break;
         }
     }
     return method;
@@ -450,17 +445,9 @@ void write_ans_histogram(BitWriter& w, const std::uint32_t* histogram, std::size
     assert(log_alpha_size >= 5 && log_alpha_size <= 8);
     assert(alphabet_size <= (std::size_t{1} << log_alpha_size));
     const auto length{static_cast<std::int32_t>(alphabet_size)};
-    const std::uint32_t method{best_method(histogram, length)};
-
     Counts counts{};
-    std::uint64_t sum{0};
-    for (std::int32_t i{0}; i < length; ++i) {
-        counts[i] = static_cast<std::int32_t>(histogram[i]);
-        sum += histogram[i];
-    }
-    if (sum == 0) {
-        counts[0] = TABLE_SIZE;
-    }
+    Normalized norm{};
+    const auto method{best_method(histogram, length, counts, norm)};
     if (method == 0) {
         // libjxl CreateFlatHistogram: the larger counts first.
         for (std::int32_t i{0}; i < length; ++i) {
@@ -470,10 +457,10 @@ void write_ans_histogram(BitWriter& w, const std::uint32_t* histogram, std::size
         encode_flat_histogram(length, w);
         return;
     }
-    Normalized norm{};
-    const bool normalized{normalize_counts(counts, length, method - 1, norm)};
-    assert(normalized);
-    (void)normalized;
+    if (norm.num_symbols == 0) {
+        counts[0] = TABLE_SIZE;
+        norm.num_symbols = 1;
+    }
     build_reverse_map(counts, length, log_alpha_size, out);
     encode_counts(counts, length, norm, method - 1, w);
 }

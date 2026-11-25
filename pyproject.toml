@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch-cujpegxl"
-version = "0.1.2.dev5"
+version = "0.1.2.dev6"
 description = "CUDA tensor bindings for the HoloCrop JPEG XL encoder"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.13,<2.14"]
