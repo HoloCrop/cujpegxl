@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -21,11 +22,13 @@ extension = CUDAExtension(
 )
 class CameraBuild(BuildExtension):
     def build_extensions(self):
-        objects = self.compiler.compile(
-            ['src/camera_coefficients.c'], output_dir=self.build_temp,
-            extra_postargs=['-O3', '-g0', '-std=gnu11', '-fvisibility=hidden'],
-        )
-        self.extensions[0].extra_objects.extend(objects)
+        directory = Path(self.build_temp).resolve() / 'camera_coefficients'
+        subprocess.run([
+            'cmake', '-S', str(root / 'third_party/jxldec'), '-B', str(directory),
+            '-DCMAKE_BUILD_TYPE=Release',
+        ], check=True)
+        subprocess.run(['cmake', '--build', str(directory), '--target', 'camera_coefficients'], check=True)
+        self.extensions[0].extra_objects.append(str(directory / 'libcamera_coefficients.a'))
         super().build_extensions()
 
 setup(ext_modules=[extension], cmdclass={'build_ext': CameraBuild})

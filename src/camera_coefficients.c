@@ -20,7 +20,7 @@ static inline void store_camera_value(int32_t* values, unsigned* written, uint64
 }
 
 #define CUJPEGXL_CAPTURE capture_blocks
-#include "../third_party/jxldec/jxl.c"
+#include "jxldec_camera.inc"
 
 // The CUDA group reader handles a single ANS preset. Other entropy models
 // use the sparse host reader and the same CUDA reconstruction kernels.
