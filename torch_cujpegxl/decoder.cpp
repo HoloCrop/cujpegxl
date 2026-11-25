@@ -23,6 +23,11 @@ void decode_camera_groups(float*, const int32_t*, camera_plan, const camera_bloc
 namespace {
 struct CameraStreamError : std::runtime_error { using std::runtime_error::runtime_error; };
 
+void validate_group(const at::Tensor& status, size_t index) {
+    if (*status.data_ptr<int>() != 0)
+        throw CameraStreamError("invalid camera AC group at batch index " + std::to_string(index));
+}
+
 struct HostPayload {
     at::Tensor values;
     std::exception_ptr error;
@@ -47,7 +52,7 @@ struct PendingDecode {
     void validate() const {
         for (size_t i = 0; i < status.size(); ++i)
             if (status[i].defined())
-                TORCH_CHECK(*status[i].data_ptr<int>() == 0, "invalid camera AC group at batch index ", i);
+                validate_group(status[i], i);
     }
 
     at::Tensor result() const {
@@ -159,8 +164,7 @@ struct Decoder {
                 pending->status[i] = std::move(host_status);
             } else if (plan.groups) {
                 checked.synchronize();
-                TORCH_CHECK(*host_status.data_ptr<int>() == 0,
-                            "invalid camera AC group at batch index ", i);
+                validate_group(host_status, i);
             }
             if (batch_size > 1)
                 finished[i].record(stream);
