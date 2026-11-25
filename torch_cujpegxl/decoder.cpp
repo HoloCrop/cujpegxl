@@ -54,7 +54,7 @@ struct PendingDecode {
         return pixels;
     }
 
-    at::Tensor on_current_stream() const {
+    at::Tensor on_current_stream() {
         for (const auto& event : checked)
             if (event.isCreated()) event.synchronize();
         validate();
