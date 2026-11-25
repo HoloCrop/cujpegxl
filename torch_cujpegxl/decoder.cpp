@@ -39,13 +39,28 @@ struct HostPayload {
 struct PendingDecode {
     at::Tensor pixels;
     std::vector<at::Tensor> status;
+    std::vector<at::cuda::CUDAEvent> checked;
     at::cuda::CUDAEvent ready;
 
-    at::Tensor result() const {
-        ready.synchronize();
+    void validate() const {
         for (size_t i = 0; i < status.size(); ++i)
             if (status[i].defined())
                 TORCH_CHECK(*status[i].data_ptr<int>() == 0, "invalid camera AC group at batch index ", i);
+    }
+
+    at::Tensor result() const {
+        ready.synchronize();
+        validate();
+        return pixels;
+    }
+
+    at::Tensor on_current_stream() const {
+        for (const auto& event : checked)
+            if (event.isCreated()) event.synchronize();
+        validate();
+        auto consumer = c10::cuda::getCurrentCUDAStream(pixels.get_device());
+        ready.block(consumer);
+        c10::cuda::CUDACachingAllocator::recordStream(pixels.storage().data_ptr(), consumer);
         return pixels;
     }
 };
@@ -83,7 +98,10 @@ struct Decoder {
         auto pinned = at::TensorOptions().dtype(at::kByte).pinned_memory(true);
         auto out =
             at::empty({batch_size, oh, ow, 3}, at::TensorOptions().device(device).dtype(at::kByte));
-        if (pending) pending->status.resize(batch_size);
+        if (pending) {
+            pending->status.resize(batch_size);
+            pending->checked.resize(batch_size);
+        }
         auto caller = c10::cuda::getCurrentCUDAStream();
         at::cuda::CUDAEvent ready;
         std::vector<at::cuda::CUDAEvent> finished(batch_size);
@@ -128,7 +146,7 @@ struct Decoder {
                 decode_camera_groups(blocks.data_ptr<float>(), gpu_values.data_ptr<int32_t>(), plan,
                                      gpu_headers, status.data_ptr<int>(), count, width, stream);
                 host_status.copy_(status, true);
-                if (!pending) checked.record(stream);
+                (pending ? pending->checked[i] : checked).record(stream);
             }
             render_camera(
                 blocks.data_ptr<float>(), gpu_headers, gpu_tables, gpu_values.data_ptr<int32_t>(),
@@ -188,7 +206,8 @@ static std::vector<std::string_view> byte_views(const std::vector<py::bytes>& im
 
 void register_decoder(py::module_& module) {
     py::class_<PendingDecode>(module, "_PendingDecode")
-        .def("result", &PendingDecode::result, py::call_guard<py::gil_scoped_release>());
+        .def("result", &PendingDecode::result, py::call_guard<py::gil_scoped_release>())
+        .def("on_current_stream", &PendingDecode::on_current_stream, py::call_guard<py::gil_scoped_release>());
     py::class_<Decoder>(module, "Decoder")
         .def(py::init<int, int, c10::DeviceIndex>(), py::arg("width"), py::arg("height"),
              py::arg("device_index") = 0)

@@ -20,8 +20,13 @@ def test_async_batches_across_streams_and_ring_wrap():
         with AsyncDecoder(width, height) as decoder:
             full = decoder.decode_batch_async(files)
             remapped = decoder.decode_batch_async(files, maps)
+            with torch.cuda.stream(torch.cuda.Stream()):
+                from_stream = remapped.on_current_stream().clone()
+                finished = torch.cuda.current_stream().record_event()
     torch.cuda.current_stream().wait_stream(source)
     torch.testing.assert_close(full.result(), reference)
+    torch.cuda.current_stream().wait_event(finished)
+    torch.testing.assert_close(from_stream, remapped.result())
     torch.testing.assert_close(remapped.result()[:, 0, 0], reference[:, 7, 3])
     torch.testing.assert_close(remapped.result()[:, 0, 1], reference[:, 15, 12])
 
@@ -39,4 +44,6 @@ def test_async_error_and_drain():
         valid = decoder.decode_batch_async([file])
     with pytest.raises(RuntimeError, match="batch index 1"):
         corrupt.result()
+    with pytest.raises(RuntimeError, match="batch index 1"):
+        corrupt.on_current_stream()
     assert torch.equal(valid.result()[0], Decoder(width, height).decode(file))

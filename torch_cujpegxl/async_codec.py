@@ -8,7 +8,7 @@ from threading import Condition, Lock, Semaphore
 
 import torch
 
-from ._native import Decoder, Encoder
+from ._native import Decoder, Encoder, _PendingDecode
 
 
 @dataclass
@@ -106,6 +106,14 @@ class AsyncEncoder(AbstractContextManager):
 class DecodedBatch(Future[torch.Tensor]):
     """Keep the allocator aware of the stream on which the caller receives the pixels."""
 
+    def __init__(self, submitted: Future[_PendingDecode]):
+        super().__init__()
+        self.submitted = submitted
+
+    def on_current_stream(self) -> torch.Tensor:
+        """Validate entropy and enqueue a device-side render wait on the consumer stream."""
+        return self.submitted.result().on_current_stream()
+
     def result(self, timeout: float | None = None) -> torch.Tensor:
         pixels = super().result(timeout)
         pixels.record_stream(torch.cuda.current_stream(pixels.device))
@@ -127,7 +135,7 @@ class AsyncDecoder(AbstractContextManager):
         self.finisher = ThreadPoolExecutor(1, thread_name_prefix="jxl-complete")
         self.closed = False
 
-    def decode_batch_async(self, images: Sequence[bytes], maps: torch.Tensor | None = None) -> Future[torch.Tensor]:
+    def decode_batch_async(self, images: Sequence[bytes], maps: torch.Tensor | None = None) -> DecodedBatch:
         """Result is validated and ready on any CUDA stream. Optional maps belong to the caller's stream."""
         files = tuple(images)
         ready = torch.cuda.current_stream(self.device).record_event() if maps is not None else None
@@ -145,7 +153,7 @@ class AsyncDecoder(AbstractContextManager):
                 self.slots.release()
                 raise RuntimeError("decoder is closed")
             submitted = self.submitter.submit(enqueue)
-            result = DecodedBatch()
+            result = DecodedBatch(submitted)
             result.set_running_or_notify_cancel()
 
             def finish():

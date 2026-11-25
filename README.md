@@ -191,8 +191,11 @@ with AsyncEncoder(width, height, distance=0.36) as encoder:
 with AsyncDecoder(width, height) as decoder:
     pixels = decoder.decode_batch_async(camera_files, maps)
     load_next_frame()
-    consume(pixels.result())
+    consume(pixels.on_current_stream())
 ```
+
+For GPU consumers, `on_current_stream()` validates the entropy and queues a CUDA
+event dependency for the render. Use `result()` for host completion.
 
 Import both classes from `torch_cujpegxl`. Two outstanding batches are allowed
 by default. At capacity, submission waits for a slot. Closing drains accepted
