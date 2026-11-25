@@ -34,19 +34,38 @@ constexpr float CB_TO_B{1.8556f};
 
 constexpr float CHROMA_CENTER{128.0f / 255.0f};
 
+// Use the same PTX instructions under Clang CUDA and NVCC.
+__device__ inline float log2_approx(float v) {
+    float result;
+    asm("lg2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(v));
+    return result;
+}
+
+__device__ inline float exp2_approx(float v) {
+    float result;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(v));
+    return result;
+}
+
+__device__ inline float reciprocal_approx(float v) {
+    float result;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(v));
+    return result;
+}
+
 // libdevice's __powf and CUDA 12's cbrtf without their handling of denormal,
 // zero, negative and infinite operands: the flushing lg2 and ex2 give
 // libdevice's results while the lg2 operand is normal and the ex2 operand is at
 // least -126.
 __device__ inline float pow_normal(float base, float exponent) {
-    return __nvvm_ex2_approx_ftz_f(exponent * __nvvm_lg2_approx_ftz_f(base));
+    return exp2_approx(exponent * log2_approx(base));
 }
 
 // cbrtf(v) for positive normal v: CUDA 12 libdevice's estimate and Newton step.
 __device__ inline float cbrt_normal(float v) {
     constexpr float THIRD{1.0f / 3.0f};
-    const float estimate{__nvvm_ex2_approx_ftz_f(THIRD * __nvvm_lg2_approx_ftz_f(v))};
-    const float residual{fmaf(__nvvm_rcp_approx_ftz_f(estimate * estimate), -v, estimate)};
+    const float estimate{exp2_approx(THIRD * log2_approx(v))};
+    const float residual{fmaf(reciprocal_approx(estimate * estimate), -v, estimate)};
     return fmaf(residual, -THIRD, estimate);
 }
 
